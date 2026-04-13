@@ -135,9 +135,23 @@ class BackgroundProcessor:
 
     async def _create_mapping(self, normalized_message) -> ConversationMapping:
         token_response = await self._token_service.get_directline_token()
+        logger.info(
+            "Token response received",
+            extra={
+                "extra": {
+                    "conversation_id_from_token": token_response.conversation_id,
+                    "expires_in": token_response.expires_in,
+                }
+            },
+        )
+        # Always ensure conversation exists, even if we have a conversationId from token response
         conversation_id = await self._directline.ensure_conversation(
             token=token_response.token,
-            conversation_id=token_response.conversation_id,
+            conversation_id=None,  # Force creating/verifying new conversation
+        )
+        logger.info(
+            "Conversation ensured",
+            extra={"extra": {"conversation_id": conversation_id}},
         )
         return ConversationMapping(
             zoom_user_id=normalized_message.zoom_user_id,

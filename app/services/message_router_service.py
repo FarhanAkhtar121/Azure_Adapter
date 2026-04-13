@@ -38,7 +38,20 @@ class MessageRouterService:
         if self._is_bot_message(zoom_user_id, sender_jid):
             return None
 
-        zoom_channel_id = self._pick(event_payload, ["channel_id", "channelId", "to_channel"])
+        zoom_channel_id = self._pick(
+            event_payload,
+            [
+                "channel_id",
+                "channelId",
+                "to_channel",
+                "toJid",
+                "to_jid",
+                "channelName",
+                "channel_name",
+                "channelJid",
+                "channel_jid",
+            ],
+        )
         zoom_thread_id = self._pick(event_payload, ["thread_id", "threadId", "message_id"])
         if not zoom_thread_id:
             zoom_thread_id = str(payload.get("event_ts") or "root")
@@ -51,7 +64,7 @@ class MessageRouterService:
             to_jid = zoom_channel_id
 
         locale = self._pick(event_payload, ["locale", "language"])
-        event_id = self._pick(event_payload, ["event_id", "id", "message_id"])
+        event_id = self._pick(event_payload, ["event_id", "id", "message_id", "triggerId", "trigger_id"])
 
         return NormalizedInboundMessage(
             event_type=event_type,

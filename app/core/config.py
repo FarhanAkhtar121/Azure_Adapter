@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     zoom_bot_jid: str = Field(default="", alias="ZOOM_BOT_JID")
     zoom_chatbot_api_base: str = Field(default="https://api.zoom.us", alias="ZOOM_CHATBOT_API_BASE")
 
-    copilot_token_endpoint: str = Field(default="", alias="COPILOT_TOKEN_ENDPOINT")
+    directline_secret: str = Field(default="", alias="DIRECTLINE_SECRET")
     directline_api_base: str = Field(
         default="https://directline.botframework.com/v3/directline", alias="DIRECTLINE_API_BASE"
     )

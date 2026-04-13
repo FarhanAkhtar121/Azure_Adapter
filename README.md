@@ -109,6 +109,8 @@ Required env vars for full flow:
 - `ZOOM_CHATBOT_API_BASE`
 - `COPILOT_TOKEN_ENDPOINT`
 
+`COPILOT_TOKEN_ENDPOINT` must be a Direct Line token endpoint for your Copilot bot (token path), not a `/conversations` endpoint.
+
 ## Local setup
 
 ```bash

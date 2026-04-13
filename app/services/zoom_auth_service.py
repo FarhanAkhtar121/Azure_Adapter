@@ -49,6 +49,12 @@ class ZoomAuthService:
             "grant_type": "account_credentials",
             "account_id": self._settings.zoom_account_id,
         }
+        
+        logger.info(
+            "Requesting Zoom access token",
+            extra={"extra": {"url": url, "account_id": self._settings.zoom_account_id}},
+        )
+        
         response = await self._client.post(
             url,
             params=params,
@@ -58,6 +64,10 @@ class ZoomAuthService:
         if response.status_code >= 500:
             response.raise_for_status()
         if response.status_code >= 400:
+            logger.error(
+                "Zoom auth failed",
+                extra={"extra": {"status": response.status_code, "response_body": response.text}},
+            )
             raise ZoomReplyError(f"Zoom auth failed with status {response.status_code}")
 
         data = response.json()

@@ -43,15 +43,25 @@ class DirectLineService:
 
     async def ensure_conversation(self, token: str, conversation_id: str | None) -> str:
         if conversation_id:
+            logger.info(
+                "Using existing conversation ID",
+                extra={"extra": {"conversation_id": conversation_id}},
+            )
             return conversation_id
         url = f"{self._base}/conversations"
+        logger.info("Creating new Direct Line conversation", extra={"extra": {"url": url}})
         response = await self._client.post(url, headers={"Authorization": f"Bearer {token}"})
         if response.status_code >= 400:
+            logger.error(
+                "Failed to start Direct Line conversation",
+                extra={"extra": {"status": response.status_code, "response_body": response.text}},
+            )
             raise DirectLineSendError(f"Failed to start Direct Line conversation: {response.status_code}")
         data = response.json()
         cid = data.get("conversationId")
         if not cid:
             raise DirectLineSendError("Direct Line conversationId missing after start")
+        logger.info("New conversation created", extra={"extra": {"conversation_id": cid}})
         return cid
 
     async def send_message(
@@ -73,12 +83,21 @@ class DirectLineService:
         if locale:
             payload["locale"] = locale
 
+        logger.info(
+            "Sending Direct Line message",
+            extra={"extra": {"url": url, "from_id": from_id, "conversation_id": conversation_id}},
+        )
+
         response = await self._client.post(
             url,
             headers={"Authorization": f"Bearer {token}"},
             json=payload,
         )
         if response.status_code >= 400:
+            logger.error(
+                "Direct Line send failed",
+                extra={"extra": {"status": response.status_code, "response_body": response.text}},
+            )
             raise DirectLineSendError(f"Direct Line send failed with status {response.status_code}")
         activity_id = response.json().get("id", "")
         return activity_id
