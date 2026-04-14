@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
@@ -62,6 +62,31 @@ class BackgroundProcessor:
                 if not mapping:
                     mapping = await self._create_mapping(normalized)
                 else:
+                    if normalized.event_id and mapping.last_zoom_event_id == normalized.event_id:
+                        logger.info(
+                            "Ignoring duplicate Zoom event",
+                            extra={
+                                "extra": {
+                                    "request_id": request_id,
+                                    "event_type": normalized.event_type,
+                                    "event_id": normalized.event_id,
+                                }
+                            },
+                        )
+                        return
+                    if self._is_recent_outbound_echo(mapping, normalized.user_text):
+                        logger.info(
+                            "Ignoring recent outbound echo",
+                            extra={
+                                "extra": {
+                                    "request_id": request_id,
+                                    "event_type": normalized.event_type,
+                                    "event_id": normalized.event_id,
+                                    "zoom_thread_id": normalized.zoom_thread_id,
+                                }
+                            },
+                        )
+                        return
                     mapping = await self._directline.maybe_refresh_mapping(mapping, self._token_service)
 
                 mapping.locale = normalized.locale
@@ -100,8 +125,10 @@ class BackgroundProcessor:
                         access_token=access_token,
                         to_jid=normalized.reply_target.to_jid,
                         text=message,
-                        thread_id=normalized.reply_target.thread_id,
+                        user_jid=normalized.reply_target.user_jid or normalized.zoom_user_id,
+                        account_id=normalized.reply_target.account_id,
                     )
+                    self._record_outbound_message(mapping, message)
 
                 mapping.watermark = watermark
                 mapping.last_activity_at = datetime.now(timezone.utc)
@@ -144,10 +171,9 @@ class BackgroundProcessor:
                 }
             },
         )
-        # Always ensure conversation exists, even if we have a conversationId from token response
         conversation_id = await self._directline.ensure_conversation(
             token=token_response.token,
-            conversation_id=None,  # Force creating/verifying new conversation
+            conversation_id=None,
         )
         logger.info(
             "Conversation ensured",
@@ -168,3 +194,33 @@ class BackgroundProcessor:
             metadata_json={"source": "zoom-team-chat"},
             last_zoom_event_id=normalized_message.event_id,
         )
+
+    @staticmethod
+    def _is_recent_outbound_echo(mapping: ConversationMapping, inbound_text: str) -> bool:
+        metadata = mapping.metadata_json or {}
+        last_outbound_text = metadata.get("last_outbound_text")
+        last_outbound_at = metadata.get("last_outbound_at")
+        if not last_outbound_text or not last_outbound_at:
+            return False
+
+        try:
+            outbound_at = datetime.fromisoformat(last_outbound_at)
+        except ValueError:
+            return False
+
+        if outbound_at.tzinfo is None:
+            outbound_at = outbound_at.replace(tzinfo=timezone.utc)
+        else:
+            outbound_at = outbound_at.astimezone(timezone.utc)
+
+        if datetime.now(timezone.utc) - outbound_at > timedelta(seconds=30):
+            return False
+
+        return inbound_text.strip() == str(last_outbound_text).strip()
+
+    @staticmethod
+    def _record_outbound_message(mapping: ConversationMapping, message: str) -> None:
+        metadata = dict(mapping.metadata_json or {})
+        metadata["last_outbound_text"] = message
+        metadata["last_outbound_at"] = datetime.now(timezone.utc).isoformat()
+        mapping.metadata_json = metadata

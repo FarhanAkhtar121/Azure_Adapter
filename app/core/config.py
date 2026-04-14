@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     zoom_client_id: str = Field(default="", alias="ZOOM_CLIENT_ID")
     zoom_client_secret: str = Field(default="", alias="ZOOM_CLIENT_SECRET")
     zoom_account_id: str = Field(default="", alias="ZOOM_ACCOUNT_ID")
+    zoom_s2s_client_id: str = Field(default="", alias="ZOOM_S2S_CLIENT_ID")
+    zoom_s2s_client_secret: str = Field(default="", alias="ZOOM_S2S_CLIENT_SECRET")
+    zoom_s2s_account_id: str = Field(default="", alias="ZOOM_S2S_ACCOUNT_ID")
     zoom_bot_jid: str = Field(default="", alias="ZOOM_BOT_JID")
     zoom_chatbot_api_base: str = Field(default="https://api.zoom.us", alias="ZOOM_CHATBOT_API_BASE")
 

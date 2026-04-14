@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ReplyTarget(BaseModel):
     to_jid: str
+    user_jid: str | None = None
+    account_id: str | None = None
     thread_id: str | None = None
     channel_id: str | None = None
 

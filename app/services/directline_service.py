@@ -30,7 +30,9 @@ class DirectLineService:
         token_service: CopilotTokenService,
     ) -> ConversationMapping:
         now = datetime.now(timezone.utc)
-        if mapping.directline_token_expires_at > now:
+        expires_at = self._normalize_utc(mapping.directline_token_expires_at)
+        mapping.directline_token_expires_at = expires_at
+        if expires_at > now:
             return mapping
 
         token_response = await token_service.get_directline_token()
@@ -40,6 +42,12 @@ class DirectLineService:
         mapping.directline_token_expires_at = token_service.compute_expiry(token_response.expires_in)
         mapping.status = "active"
         return mapping
+
+    @staticmethod
+    def _normalize_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     async def ensure_conversation(self, token: str, conversation_id: str | None) -> str:
         if conversation_id:

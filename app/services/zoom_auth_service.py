@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 
 
 class ZoomAuthService:
-    """Retrieves and caches Zoom Chatbot API access tokens."""
+    """Retrieves and caches Zoom chatbot OAuth tokens for outbound chatbot replies."""
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None):
         self._settings = settings
@@ -40,41 +40,48 @@ class ZoomAuthService:
         retry=retry_if_exception_type((httpx.TimeoutException, httpx.HTTPStatusError)),
     )
     async def _fetch_token(self) -> tuple[str, int]:
-        if not self._settings.zoom_client_id or not self._settings.zoom_client_secret:
-            raise ZoomReplyError("Zoom client credentials are not configured")
+        client_id, client_secret = self._resolve_chatbot_credentials()
 
-        base = self._settings.zoom_chatbot_api_base.rstrip("/")
-        url = f"{base}/oauth/token"
-        params = {
-            "grant_type": "account_credentials",
-            "account_id": self._settings.zoom_account_id,
-        }
-        
+        url = "https://zoom.us/oauth/token"
+        params = {"grant_type": "client_credentials"}
+
         logger.info(
-            "Requesting Zoom access token",
-            extra={"extra": {"url": url, "account_id": self._settings.zoom_account_id}},
+            "Requesting Zoom chatbot access token",
+            extra={
+                "extra": {
+                    "url": url,
+                    "grant_type": "client_credentials",
+                    "credential_source": "chatbot",
+                }
+            },
         )
-        
+
         response = await self._client.post(
             url,
             params=params,
-            auth=httpx.BasicAuth(self._settings.zoom_client_id, self._settings.zoom_client_secret),
+            auth=httpx.BasicAuth(client_id, client_secret),
         )
 
         if response.status_code >= 500:
             response.raise_for_status()
         if response.status_code >= 400:
             logger.error(
-                "Zoom auth failed",
+                "Zoom chatbot auth failed",
                 extra={"extra": {"status": response.status_code, "response_body": response.text}},
             )
-            raise ZoomReplyError(f"Zoom auth failed with status {response.status_code}")
+            raise ZoomReplyError(f"Zoom chatbot auth failed with status {response.status_code}")
 
         data = response.json()
         token = data.get("access_token")
         expires_in = int(data.get("expires_in", 3600))
         if not token:
-            raise ZoomReplyError("Zoom auth response missing access_token")
+            raise ZoomReplyError("Zoom chatbot auth response missing access_token")
 
-        logger.info("Zoom access token refreshed", extra={"extra": {"expires_in": expires_in}})
+        logger.info("Zoom chatbot access token refreshed", extra={"extra": {"expires_in": expires_in}})
         return token, expires_in
+
+    def _resolve_chatbot_credentials(self) -> tuple[str, str]:
+        if not self._settings.zoom_client_id or not self._settings.zoom_client_secret:
+            raise ZoomReplyError("Zoom chatbot client credentials are not configured")
+
+        return self._settings.zoom_client_id, self._settings.zoom_client_secret

@@ -45,6 +45,29 @@ async def test_maybe_refresh_mapping_updates_expired_token() -> None:
 
 
 @pytest.mark.asyncio
+async def test_maybe_refresh_mapping_accepts_naive_expiry_from_sqlite() -> None:
+    settings = Settings(DIRECTLINE_API_BASE="https://directline.botframework.com/v3/directline")
+    service = DirectLineService(settings=settings, client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: None)))
+
+    mapping = ConversationMapping(
+        zoom_user_id="u",
+        zoom_channel_id="c",
+        zoom_thread_id="t",
+        zoom_to_jid="jid",
+        directline_conversation_id="old",
+        directline_token="still-valid",
+        directline_token_expires_at=datetime.utcnow() + timedelta(seconds=300),
+        last_activity_at=datetime.now(timezone.utc),
+        status="active",
+    )
+
+    refreshed = await service.maybe_refresh_mapping(mapping, StubTokenService())
+    assert refreshed.directline_token == "still-valid"
+    assert refreshed.directline_conversation_id == "old"
+    assert refreshed.directline_token_expires_at.tzinfo is not None
+
+
+@pytest.mark.asyncio
 async def test_send_and_poll_directline() -> None:
     events = [
         {

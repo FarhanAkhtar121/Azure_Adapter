@@ -15,6 +15,9 @@ class MessageRouterService:
         "slash_command",
         "im.chat.message",
         "message",
+        "team_chat.dm_message_posted",
+        "team_chat.channel_message_posted",
+        "team_chat.app_mention",
     }
 
     def __init__(self, settings: Settings):
@@ -29,42 +32,78 @@ class MessageRouterService:
             return None
 
         event_payload = payload.get("payload") or {}
-        user_text = self._extract_text(event_payload)
+        object_payload = event_payload.get("object") if isinstance(event_payload.get("object"), dict) else {}
+
+        user_text = self._extract_text(event_payload, object_payload)
         if not user_text:
             return None
 
-        zoom_user_id = self._pick(event_payload, ["user_id", "userId", "sender_id", "userJid"])
-        sender_jid = self._pick(event_payload, ["user_jid", "sender_jid", "userJid"])
+        zoom_user_id = self._pick_from_sources(
+            [event_payload, object_payload],
+            ["operator_id", "user_id", "userId", "sender_id", "operator_member_id", "userJid"],
+        )
+
+        sender_jid = self._pick_from_sources(
+            [event_payload, object_payload],
+            ["userJid", "user_jid", "sender_jid"],
+        )
+
         if self._is_bot_message(zoom_user_id, sender_jid):
             return None
 
-        zoom_channel_id = self._pick(
-            event_payload,
+        explicit_channel_id = self._pick_from_sources(
+            [object_payload, event_payload],
+            ["channel_id", "channelId", "to_channel"],
+        )
+
+        zoom_channel_id = explicit_channel_id or self._pick_from_sources(
+            [object_payload, event_payload],
             [
-                "channel_id",
-                "channelId",
-                "to_channel",
+                "contact_id",
+                "contact_member_id",
+                "contact_email",
                 "toJid",
                 "to_jid",
                 "channelName",
                 "channel_name",
                 "channelJid",
                 "channel_jid",
+                "session_id",
             ],
         )
-        zoom_thread_id = self._pick(event_payload, ["thread_id", "threadId", "message_id"])
+
+        zoom_thread_id = self._pick_from_sources(
+            [object_payload, event_payload],
+            ["reply_main_message_id", "thread_id", "threadId", "message_id", "id"],
+        )
         if not zoom_thread_id:
             zoom_thread_id = str(payload.get("event_ts") or "root")
 
         if not zoom_user_id or not zoom_channel_id:
             raise MalformedZoomPayloadError("Missing required Zoom identifiers")
 
-        to_jid = self._pick(event_payload, ["to_jid", "toJid", "channel_jid", "chat_jid"])
+        to_jid = self._pick_from_sources(
+            [object_payload, event_payload],
+            ["toJid", "to_jid", "channel_jid", "chat_jid", "session_id", "contact_id", "contact_member_id"],
+        )
         if not to_jid:
             to_jid = zoom_channel_id
 
-        locale = self._pick(event_payload, ["locale", "language"])
-        event_id = self._pick(event_payload, ["event_id", "id", "message_id", "triggerId", "trigger_id"])
+        user_jid = sender_jid or self._pick_from_sources(
+            [event_payload, object_payload],
+            ["userJid", "user_jid"],
+        )
+
+        account_id = self._pick_from_sources(
+            [event_payload, object_payload],
+            ["accountId", "account_id"],
+        )
+
+        locale = self._pick_from_sources([event_payload, object_payload], ["locale", "language"])
+        event_id = self._pick_from_sources(
+            [object_payload, event_payload],
+            ["event_id", "id", "message_id", "triggerId", "trigger_id"],
+        )
 
         return NormalizedInboundMessage(
             event_type=event_type,
@@ -76,18 +115,22 @@ class MessageRouterService:
             locale=locale,
             reply_target=ReplyTarget(
                 to_jid=to_jid,
+                user_jid=user_jid,
+                account_id=account_id,
                 thread_id=zoom_thread_id,
-                channel_id=zoom_channel_id,
+                channel_id=explicit_channel_id,
             ),
             occurred_at=datetime.now(timezone.utc),
             raw_metadata={
                 "sender_jid": sender_jid,
-                "trigger": self._pick(event_payload, ["cmd", "command"]),
+                "account_id": account_id,
+                "trigger": self._pick_from_sources([event_payload, object_payload], ["cmd", "command"]),
+                "operator": self._pick(event_payload, ["operator"]),
             },
         )
 
-    def _extract_text(self, event_payload: dict) -> str:
-        text = self._pick(event_payload, ["cmd", "text", "message", "body"])
+    def _extract_text(self, event_payload: dict, object_payload: dict) -> str:
+        text = self._pick_from_sources([object_payload, event_payload], ["cmd", "text", "message", "body"])
         if isinstance(text, dict):
             text = text.get("text", "")
         return text or ""
@@ -100,8 +143,22 @@ class MessageRouterService:
                 return value.strip()
         return None
 
+    @classmethod
+    def _pick_from_sources(cls, payloads: list[dict], keys: list[str]) -> str | None:
+        for source in payloads:
+            value = cls._pick(source, keys)
+            if value:
+                return value
+        return None
+
     def _is_bot_message(self, zoom_user_id: str | None, sender_jid: str | None) -> bool:
         bot_jid = self._settings.zoom_bot_jid
         if not bot_jid:
             return False
-        return sender_jid == bot_jid or zoom_user_id == bot_jid
+
+        bot_jid_normalized = bot_jid.strip().lower()
+        bot_user_id = bot_jid_normalized.split("@", 1)[0]
+        sender_jid_normalized = sender_jid.strip().lower() if sender_jid else None
+        zoom_user_id_normalized = zoom_user_id.strip().lower() if zoom_user_id else None
+
+        return sender_jid_normalized == bot_jid_normalized or zoom_user_id_normalized == bot_user_id
