@@ -7,10 +7,10 @@ import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from app.core.config import Settings
-from app.core.exceptions import DirectLineReceiveTimeoutError, DirectLineSendError
+from app.core.exceptions import DirectLineConversationExpiredError, DirectLineReceiveTimeoutError, DirectLineSendError
 from app.core.logging import get_logger
 from app.models.conversation_mapping import ConversationMapping
-from app.schemas.directline import DirectLineActivitiesResponse
+from app.schemas.directline import DirectLineActivitiesResponse, DirectLineAttachment
 from app.services.copilot_token_service import CopilotTokenService
 
 logger = get_logger(__name__)
@@ -30,7 +30,9 @@ class DirectLineService:
         token_service: CopilotTokenService,
     ) -> ConversationMapping:
         now = datetime.now(timezone.utc)
-        if mapping.directline_token_expires_at > now:
+        expires_at = self._normalize_utc(mapping.directline_token_expires_at)
+        mapping.directline_token_expires_at = expires_at
+        if expires_at > now:
             return mapping
 
         token_response = await token_service.get_directline_token()
@@ -41,17 +43,33 @@ class DirectLineService:
         mapping.status = "active"
         return mapping
 
+    @staticmethod
+    def _normalize_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     async def ensure_conversation(self, token: str, conversation_id: str | None) -> str:
         if conversation_id:
+            logger.info(
+                "Using existing conversation ID",
+                extra={"extra": {"conversation_id": conversation_id}},
+            )
             return conversation_id
         url = f"{self._base}/conversations"
+        logger.info("Creating new Direct Line conversation", extra={"extra": {"url": url}})
         response = await self._client.post(url, headers={"Authorization": f"Bearer {token}"})
         if response.status_code >= 400:
+            logger.error(
+                "Failed to start Direct Line conversation",
+                extra={"extra": {"status": response.status_code, "response_body": response.text}},
+            )
             raise DirectLineSendError(f"Failed to start Direct Line conversation: {response.status_code}")
         data = response.json()
         cid = data.get("conversationId")
         if not cid:
             raise DirectLineSendError("Direct Line conversationId missing after start")
+        logger.info("New conversation created", extra={"extra": {"conversation_id": cid}})
         return cid
 
     async def send_message(
@@ -73,12 +91,25 @@ class DirectLineService:
         if locale:
             payload["locale"] = locale
 
+        logger.info(
+            "Sending Direct Line message",
+            extra={"extra": {"url": url, "from_id": from_id, "conversation_id": conversation_id}},
+        )
+
         response = await self._client.post(
             url,
             headers={"Authorization": f"Bearer {token}"},
             json=payload,
         )
+        if response.status_code == 404:
+            raise DirectLineConversationExpiredError(
+                f"Direct Line conversation not found (expired): {conversation_id}"
+            )
         if response.status_code >= 400:
+            logger.error(
+                "Direct Line send failed",
+                extra={"extra": {"status": response.status_code, "response_body": response.text}},
+            )
             raise DirectLineSendError(f"Direct Line send failed with status {response.status_code}")
         activity_id = response.json().get("id", "")
         return activity_id
@@ -142,16 +173,68 @@ class DirectLineService:
                     continue
                 seen_ids.add(activity.id)
 
+                attachment_types = [
+                    a.content_type for a in activity.attachments if a.content_type
+                ]
+                if self._settings.debug_transcript_logging:
+                    logger.debug(
+                        "Direct Line activity received",
+                        extra={
+                            "extra": {
+                                "activity_id": activity.id,
+                                "type": activity.type,
+                                "sender": activity.from_.id if activity.from_ else None,
+                                "has_text": bool(activity.text),
+                                "text_preview": (activity.text or "")[:120],
+                                "attachment_count": len(activity.attachments),
+                                "attachment_types": attachment_types,
+                            }
+                        },
+                    )
+
                 if activity.type != "message":
+                    logger.debug(
+                        "Skipping non-message activity",
+                        extra={"extra": {"activity_id": activity.id, "type": activity.type}},
+                    )
                     continue
 
                 sender = activity.from_.id if activity.from_ else ""
                 if sender == user_from_id:
                     continue
 
-                if activity.text:
-                    messages.append(activity.text)
+                text = activity.text
+                if not text:
+                    # Attempt to extract readable text from adaptive card / hero card attachments
+                    for attachment in activity.attachments:
+                        extracted = self._extract_attachment_text(attachment)
+                        if extracted:
+                            text = extracted
+                            logger.info(
+                                "Extracted fallback text from attachment",
+                                extra={
+                                    "extra": {
+                                        "activity_id": activity.id,
+                                        "content_type": attachment.content_type,
+                                        "text_preview": text[:120],
+                                    }
+                                },
+                            )
+                            break
+
+                if text:
+                    messages.append(text)
                     new_bot_messages += 1
+                else:
+                    logger.warning(
+                        "Bot message has no text and no extractable attachment content — dropped",
+                        extra={
+                            "extra": {
+                                "activity_id": activity.id,
+                                "attachment_types": attachment_types,
+                            }
+                        },
+                    )
 
             if new_bot_messages > 0:
                 got_first_bot_reply = True
@@ -164,3 +247,64 @@ class DirectLineService:
             raise DirectLineReceiveTimeoutError("No bot messages received within polling timeout")
 
         return messages, current_watermark
+
+    @staticmethod
+    def _extract_attachment_text(attachment: DirectLineAttachment) -> str | None:
+        """Extract readable plain text from a Bot Framework card attachment.
+
+        Supports:
+        - application/vnd.microsoft.card.adaptive  (Adaptive Card)
+        - application/vnd.microsoft.card.hero      (Hero Card)
+        - application/vnd.microsoft.card.thumbnail (Thumbnail Card)
+        """
+        content = attachment.content
+        if not content or not attachment.content_type:
+            return None
+
+        ct = attachment.content_type
+
+        if ct == "application/vnd.microsoft.card.adaptive":
+            return DirectLineService._extract_adaptive_card_text(content)
+
+        if ct in (
+            "application/vnd.microsoft.card.hero",
+            "application/vnd.microsoft.card.thumbnail",
+        ):
+            parts: list[str] = []
+            if content.get("title"):
+                parts.append(content["title"])
+            if content.get("subtitle"):
+                parts.append(content["subtitle"])
+            if content.get("text"):
+                parts.append(content["text"])
+            return "\n".join(parts) if parts else None
+
+        return None
+
+    @staticmethod
+    def _extract_adaptive_card_text(content: dict) -> str | None:
+        """Recursively pull TextBlock / FactSet text out of an Adaptive Card body."""
+        lines: list[str] = []
+
+        def _collect(elements: list) -> None:
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                elem_type = element.get("type", "")
+                if elem_type == "TextBlock":
+                    t = element.get("text", "")
+                    if t:
+                        lines.append(t)
+                elif elem_type == "FactSet":
+                    for fact in element.get("facts", []):
+                        title = fact.get("title", "")
+                        value = fact.get("value", "")
+                        if title and value:
+                            lines.append(f"{title}: {value}")
+                        elif value:
+                            lines.append(value)
+                elif elem_type in ("Container", "Column", "ColumnSet"):
+                    _collect(element.get("items", []) or element.get("columns", []))
+
+        _collect(content.get("body", []))
+        return "\n".join(lines) if lines else None

@@ -9,6 +9,7 @@ def test_zoom_message_payload_creation() -> None:
     payload = service.build_message_payload(
         to_jid="user@xmpp.zoom.us",
         text="hello",
+        user_jid="user@xmpp.zoom.us",
         thread_id="thread-1",
     )
 

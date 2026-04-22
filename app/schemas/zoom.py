@@ -13,20 +13,25 @@ class ZoomWebhookPayload(BaseModel):
     event_ts: int | None = None
 
 
+class ZoomReplyHead(BaseModel):
+    text: str
+
+
 class ZoomReplyBodyItem(BaseModel):
     type: str = "message"
     text: str
 
 
 class ZoomReplyContent(BaseModel):
-    head: dict
+    head: ZoomReplyHead
     body: list[ZoomReplyBodyItem]
 
 
 class ZoomChatMessageRequest(BaseModel):
     robot_jid: str
     to_jid: str
-    account_id: str | None = None
-    user_jid: str | None = None
-    thread_id: str | None = None
+    account_id: str
+    user_jid: str
+    is_markdown_support: bool = True
     content: ZoomReplyContent
+    thread_id: str | None = None

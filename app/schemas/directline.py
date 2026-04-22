@@ -15,6 +15,14 @@ class DirectLineMessageFrom(BaseModel):
     id: str
 
 
+class DirectLineAttachment(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    content_type: str | None = Field(default=None, alias="contentType")
+    content: dict | None = None
+    name: str | None = None
+
+
 class DirectLineActivity(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -22,6 +30,8 @@ class DirectLineActivity(BaseModel):
     type: str
     from_: DirectLineMessageFrom | None = Field(default=None, alias="from")
     text: str | None = None
+    speak: str | None = None
+    attachments: list[DirectLineAttachment] = Field(default_factory=list)
 
 
 class DirectLineActivitiesResponse(BaseModel):

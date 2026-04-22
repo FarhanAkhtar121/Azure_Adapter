@@ -95,3 +95,108 @@ async def test_send_and_poll_directline() -> None:
     assert watermark == "2"
 
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_extracts_adaptive_card_fallback_text() -> None:
+    """When Copilot Studio returns an adaptive card with no text field, poll_for_bot_reply
+    should extract the card body TextBlocks and FactSet entries as plain text."""
+    adaptive_card_activity = {
+        "id": "10",
+        "type": "message",
+        "from": {"id": "bot"},
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "type": "AdaptiveCard",
+                    "body": [
+                        {"type": "TextBlock", "text": "Your ticket has been created."},
+                        {
+                            "type": "FactSet",
+                            "facts": [
+                                {"title": "Ticket ID", "value": "INC001"},
+                                {"title": "Status", "value": "Open"},
+                            ],
+                        },
+                    ],
+                },
+            }
+        ],
+    }
+    events = [
+        {"activities": [adaptive_card_activity], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = calls["get"]
+            calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2, DEBUG_TRANSCRIPT_LOGGING=True)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, watermark = await service.poll_for_bot_reply(
+        conversation_id="conv1",
+        token="token",
+        watermark=None,
+        user_from_id="zoom:u1",
+    )
+
+    assert messages == ["Your ticket has been created.\nTicket ID: INC001\nStatus: Open"]
+    assert watermark == "1"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_extracts_hero_card_text() -> None:
+    """Hero card with title + subtitle + text should be rendered as joined plain text."""
+    hero_card_activity = {
+        "id": "20",
+        "type": "message",
+        "from": {"id": "bot"},
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.hero",
+                "content": {
+                    "title": "Ticket Created",
+                    "subtitle": "INC001",
+                    "text": "Your request has been logged.",
+                },
+            }
+        ],
+    }
+    events = [
+        {"activities": [hero_card_activity], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = calls["get"]
+            calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, watermark = await service.poll_for_bot_reply(
+        conversation_id="conv1",
+        token="token",
+        watermark=None,
+        user_from_id="zoom:u1",
+    )
+
+    assert messages == ["Ticket Created\nINC001\nYour request has been logged."]
+    assert watermark == "1"
+
+    await client.aclose()

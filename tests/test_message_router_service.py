@@ -32,3 +32,37 @@ def test_unsupported_event_is_ignored() -> None:
     payload = {"event": "unsupported_event", "payload": {"cmd": "hello"}}
 
     assert router.normalize(payload) is None
+
+
+def test_normalize_uses_stable_root_thread_when_thread_missing() -> None:
+    router = MessageRouterService(Settings(ZOOM_BOT_JID="bot@xmpp.zoom.us"))
+
+    payload_first = {
+        "event": "bot_notification",
+        "event_ts": 1710000000,
+        "payload": {
+            "cmd": "create ticket",
+            "user_id": "u1",
+            "channel_id": "c1",
+            "to_jid": "tojid",
+        },
+    }
+    payload_second = {
+        "event": "bot_notification",
+        "event_ts": 1710001234,
+        "payload": {
+            "cmd": "yes",
+            "user_id": "u1",
+            "channel_id": "c1",
+            "to_jid": "tojid",
+        },
+    }
+
+    normalized_first = router.normalize(payload_first)
+    normalized_second = router.normalize(payload_second)
+
+    assert normalized_first is not None
+    assert normalized_second is not None
+    assert normalized_first.zoom_thread_id == "root"
+    assert normalized_second.zoom_thread_id == "root"
+    assert normalized_first.zoom_thread_id == normalized_second.zoom_thread_id

@@ -18,6 +18,10 @@ class DirectLineSendError(AdapterError):
     """Raised when sending a user message to Direct Line fails."""
 
 
+class DirectLineConversationExpiredError(DirectLineSendError):
+    """Raised when Direct Line returns 404 because the conversation has expired server-side."""
+
+
 class DirectLineReceiveTimeoutError(AdapterError):
     """Raised when no Direct Line bot reply is received before timeout."""
 

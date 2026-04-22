@@ -1,0 +1,48 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# SQLite and local runtime data
+*.db
+*.sqlite
+*.sqlite3
+zoom_copilot_adapter.db
+
+# Logs
+*.log
+
+# IDE/editor metadata
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from app.core.config import Settings
 from app.core.logging import get_logger
+from app.core.exceptions import DirectLineConversationExpiredError
 from app.models.conversation_mapping import ConversationMapping
 from app.repositories.sqlalchemy_conversation_repository import SqlAlchemyConversationRepository
 from app.services.copilot_token_service import CopilotTokenService
@@ -62,6 +63,31 @@ class BackgroundProcessor:
                 if not mapping:
                     mapping = await self._create_mapping(normalized)
                 else:
+                    if normalized.event_id and mapping.last_zoom_event_id == normalized.event_id:
+                        logger.info(
+                            "Ignoring duplicate Zoom event",
+                            extra={
+                                "extra": {
+                                    "request_id": request_id,
+                                    "event_type": normalized.event_type,
+                                    "event_id": normalized.event_id,
+                                }
+                            },
+                        )
+                        return
+                    if self._is_recent_outbound_echo(mapping, normalized.user_text):
+                        logger.info(
+                            "Ignoring recent outbound echo",
+                            extra={
+                                "extra": {
+                                    "request_id": request_id,
+                                    "event_type": normalized.event_type,
+                                    "event_id": normalized.event_id,
+                                    "zoom_thread_id": normalized.zoom_thread_id,
+                                }
+                            },
+                        )
+                        return
                     mapping = await self._directline.maybe_refresh_mapping(mapping, self._token_service)
 
                 mapping.locale = normalized.locale
@@ -73,19 +99,42 @@ class BackgroundProcessor:
                 mapping_id = mapping.id
 
                 user_from_id = f"zoom:{normalized.zoom_user_id}"
-                await self._directline.send_message(
-                    conversation_id=mapping.directline_conversation_id,
-                    token=mapping.directline_token,
-                    text=normalized.user_text,
-                    from_id=user_from_id,
-                    locale=normalized.locale,
-                    metadata={
-                        "zoom_user_id": normalized.zoom_user_id,
-                        "zoom_channel_id": normalized.zoom_channel_id,
-                        "zoom_thread_id": normalized.zoom_thread_id,
-                        "source": "zoom-team-chat",
-                    },
-                )
+                _send_metadata = {
+                    "zoom_user_id": normalized.zoom_user_id,
+                    "zoom_channel_id": normalized.zoom_channel_id,
+                    "zoom_thread_id": normalized.zoom_thread_id,
+                    "source": "zoom-team-chat",
+                }
+                try:
+                    await self._directline.send_message(
+                        conversation_id=mapping.directline_conversation_id,
+                        token=mapping.directline_token,
+                        text=normalized.user_text,
+                        from_id=user_from_id,
+                        locale=normalized.locale,
+                        metadata=_send_metadata,
+                    )
+                except DirectLineConversationExpiredError:
+                    logger.warning(
+                        "Direct Line conversation expired — resetting and retrying",
+                        extra={
+                            "extra": {
+                                "request_id": request_id,
+                                "stale_conversation_id": mapping.directline_conversation_id,
+                            }
+                        },
+                    )
+                    mapping = await self._reset_conversation(mapping)
+                    mapping = await repo.upsert_mapping(mapping)
+                    mapping_id = mapping.id
+                    await self._directline.send_message(
+                        conversation_id=mapping.directline_conversation_id,
+                        token=mapping.directline_token,
+                        text=normalized.user_text,
+                        from_id=user_from_id,
+                        locale=normalized.locale,
+                        metadata=_send_metadata,
+                    )
 
                 bot_messages, watermark = await self._directline.poll_for_bot_reply(
                     conversation_id=mapping.directline_conversation_id,
@@ -100,8 +149,10 @@ class BackgroundProcessor:
                         access_token=access_token,
                         to_jid=normalized.reply_target.to_jid,
                         text=message,
-                        thread_id=normalized.reply_target.thread_id,
+                        user_jid=normalized.reply_target.user_jid or normalized.zoom_user_id,
+                        account_id=normalized.reply_target.account_id,
                     )
+                    self._record_outbound_message(mapping, message)
 
                 mapping.watermark = watermark
                 mapping.last_activity_at = datetime.now(timezone.utc)
@@ -133,11 +184,51 @@ class BackgroundProcessor:
                     repo = SqlAlchemyConversationRepository(session)
                     await repo.mark_failed(mapping_id, str(exc))
 
-    async def _create_mapping(self, normalized_message) -> ConversationMapping:
+    async def _reset_conversation(self, mapping: ConversationMapping) -> ConversationMapping:
+        """Obtain a fresh Direct Line token + conversation and update the mapping in place."""
         token_response = await self._token_service.get_directline_token()
+        logger.info(
+            "Fresh token acquired for reset conversation",
+            extra={
+                "extra": {
+                    "conversation_id_from_token": token_response.conversation_id,
+                    "expires_in": token_response.expires_in,
+                }
+            },
+        )
         conversation_id = await self._directline.ensure_conversation(
             token=token_response.token,
-            conversation_id=token_response.conversation_id,
+            conversation_id=None,
+        )
+        logger.info(
+            "Replacement conversation created",
+            extra={"extra": {"conversation_id": conversation_id}},
+        )
+        mapping.directline_conversation_id = conversation_id
+        mapping.directline_token = token_response.token
+        mapping.directline_token_expires_at = self._token_service.compute_expiry(token_response.expires_in)
+        mapping.watermark = None
+        mapping.status = "active"
+        return mapping
+
+    async def _create_mapping(self, normalized_message) -> ConversationMapping:
+        token_response = await self._token_service.get_directline_token()
+        logger.info(
+            "Token response received",
+            extra={
+                "extra": {
+                    "conversation_id_from_token": token_response.conversation_id,
+                    "expires_in": token_response.expires_in,
+                }
+            },
+        )
+        conversation_id = await self._directline.ensure_conversation(
+            token=token_response.token,
+            conversation_id=None,
+        )
+        logger.info(
+            "Conversation ensured",
+            extra={"extra": {"conversation_id": conversation_id}},
         )
         return ConversationMapping(
             zoom_user_id=normalized_message.zoom_user_id,
@@ -154,3 +245,33 @@ class BackgroundProcessor:
             metadata_json={"source": "zoom-team-chat"},
             last_zoom_event_id=normalized_message.event_id,
         )
+
+    @staticmethod
+    def _is_recent_outbound_echo(mapping: ConversationMapping, inbound_text: str) -> bool:
+        metadata = mapping.metadata_json or {}
+        last_outbound_text = metadata.get("last_outbound_text")
+        last_outbound_at = metadata.get("last_outbound_at")
+        if not last_outbound_text or not last_outbound_at:
+            return False
+
+        try:
+            outbound_at = datetime.fromisoformat(last_outbound_at)
+        except ValueError:
+            return False
+
+        if outbound_at.tzinfo is None:
+            outbound_at = outbound_at.replace(tzinfo=timezone.utc)
+        else:
+            outbound_at = outbound_at.astimezone(timezone.utc)
+
+        if datetime.now(timezone.utc) - outbound_at > timedelta(seconds=30):
+            return False
+
+        return inbound_text.strip() == str(last_outbound_text).strip()
+
+    @staticmethod
+    def _record_outbound_message(mapping: ConversationMapping, message: str) -> None:
+        metadata = dict(mapping.metadata_json or {})
+        metadata["last_outbound_text"] = message
+        metadata["last_outbound_at"] = datetime.now(timezone.utc).isoformat()
+        mapping.metadata_json = metadata

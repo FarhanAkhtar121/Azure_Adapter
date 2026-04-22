@@ -21,10 +21,13 @@ class Settings(BaseSettings):
     zoom_client_id: str = Field(default="", alias="ZOOM_CLIENT_ID")
     zoom_client_secret: str = Field(default="", alias="ZOOM_CLIENT_SECRET")
     zoom_account_id: str = Field(default="", alias="ZOOM_ACCOUNT_ID")
+    zoom_s2s_client_id: str = Field(default="", alias="ZOOM_S2S_CLIENT_ID")
+    zoom_s2s_client_secret: str = Field(default="", alias="ZOOM_S2S_CLIENT_SECRET")
+    zoom_s2s_account_id: str = Field(default="", alias="ZOOM_S2S_ACCOUNT_ID")
     zoom_bot_jid: str = Field(default="", alias="ZOOM_BOT_JID")
     zoom_chatbot_api_base: str = Field(default="https://api.zoom.us", alias="ZOOM_CHATBOT_API_BASE")
 
-    copilot_token_endpoint: str = Field(default="", alias="COPILOT_TOKEN_ENDPOINT")
+    directline_secret: str = Field(default="", alias="DIRECTLINE_SECRET")
     directline_api_base: str = Field(
         default="https://directline.botframework.com/v3/directline", alias="DIRECTLINE_API_BASE"
     )
