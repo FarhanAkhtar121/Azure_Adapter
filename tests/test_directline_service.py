@@ -85,7 +85,7 @@ async def test_send_and_poll_directline() -> None:
     )
     assert activity_id == "activity-id"
 
-    messages, watermark = await service.poll_for_bot_reply(
+    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -93,6 +93,7 @@ async def test_send_and_poll_directline() -> None:
     )
     assert messages == ["hi there"]
     assert watermark == "2"
+    assert pending_inputs == []
 
     await client.aclose()
 
@@ -141,7 +142,7 @@ async def test_poll_extracts_adaptive_card_fallback_text() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2, DEBUG_TRANSCRIPT_LOGGING=True)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, watermark = await service.poll_for_bot_reply(
+    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -150,6 +151,7 @@ async def test_poll_extracts_adaptive_card_fallback_text() -> None:
 
     assert messages == ["Your ticket has been created.\nTicket ID: INC001\nStatus: Open"]
     assert watermark == "1"
+    assert pending_inputs == []
 
     await client.aclose()
 
@@ -189,7 +191,7 @@ async def test_poll_extracts_hero_card_text() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, watermark = await service.poll_for_bot_reply(
+    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -198,5 +200,126 @@ async def test_poll_extracts_hero_card_text() -> None:
 
     assert messages == ["Ticket Created\nINC001\nYour request has been logged."]
     assert watermark == "1"
+    assert pending_inputs == []
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_detects_adaptive_card_inputs_for_submit() -> None:
+    card_with_inputs = {
+        "id": "30", "type": "message", "from": {"id": "bot"},
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "type": "AdaptiveCard",
+                "body": [
+                    {"type": "TextBlock", "text": "Please answer the following questions:"},
+                    {"type": "Input.Text", "id": "userAnswers", "isMultiline": True},
+                ],
+                "actions": [
+                    {
+                        "type": "Action.Submit",
+                        "title": "Submit details",
+                        "data": {"ticketStage": "clarification", "flowId": "abc123"},
+                    }
+                ],
+            },
+        }],
+    }
+    events = [
+        {"activities": [card_with_inputs], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = calls["get"]; calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
+        conversation_id="conv1", token="token", watermark=None, user_from_id="zoom:u1",
+    )
+
+    assert messages == ["Please answer the following questions:"]
+    assert pending_inputs == [
+        {
+            "id": "userAnswers",
+            "type": "Input.Text",
+            "label": None,
+            "value": None,
+            "placeholder": None,
+            "action_data": {"ticketStage": "clarification", "flowId": "abc123"},
+        }
+    ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_renders_adaptive_card_input_values() -> None:
+    card_with_editable_values = {
+        "id": "40",
+        "type": "message",
+        "from": {"id": "bot"},
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "type": "AdaptiveCard",
+                    "body": [
+                        {"type": "TextBlock", "text": "Review and Edit Ticket Details"},
+                        {
+                            "type": "Input.Text",
+                            "id": "confirmed_short_description",
+                            "label": "Short Description",
+                            "value": "Printer issue",
+                        },
+                        {
+                            "type": "Input.Text",
+                            "id": "confirmed_Category",
+                            "label": "Category",
+                            "value": "Hardware",
+                        },
+                    ],
+                    "actions": [{"type": "Action.Submit", "title": "Confirm"}],
+                },
+            }
+        ],
+    }
+    events = [
+        {"activities": [card_with_editable_values], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = calls["get"]
+            calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
+        conversation_id="conv1",
+        token="token",
+        watermark=None,
+        user_from_id="zoom:u1",
+    )
+
+    assert messages == [
+        "Review and Edit Ticket Details\nShort Description: Printer issue\nCategory: Hardware"
+    ]
+    assert watermark == "1"
+    assert pending_inputs[0]["id"] == "confirmed_short_description"
 
     await client.aclose()

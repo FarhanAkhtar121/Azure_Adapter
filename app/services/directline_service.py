@@ -80,6 +80,7 @@ class DirectLineService:
         from_id: str,
         locale: str | None,
         metadata: dict,
+        value: dict | None = None,
     ) -> str:
         url = f"{self._base}/conversations/{conversation_id}/activities"
         payload: dict = {
@@ -88,6 +89,8 @@ class DirectLineService:
             "from": {"id": from_id},
             "channelData": metadata,
         }
+        if value:
+            payload["value"] = value
         if locale:
             payload["locale"] = locale
 
@@ -149,7 +152,7 @@ class DirectLineService:
         token: str,
         watermark: str | None,
         user_from_id: str,
-    ) -> tuple[list[str], str | None]:
+    ) -> tuple[list[str], str | None, list[dict]]:
         timeout_seconds = self._settings.poll_timeout_seconds
         interval = self._settings.poll_interval_seconds
 
@@ -158,6 +161,7 @@ class DirectLineService:
         messages: list[str] = []
         current_watermark = watermark
         got_first_bot_reply = False
+        pending_card_inputs: list[dict] = []
 
         while (asyncio.get_event_loop().time() - start) < timeout_seconds:
             activities_response = await self.get_activities(
@@ -203,9 +207,17 @@ class DirectLineService:
                 if sender == user_from_id:
                     continue
 
+                for attachment in activity.attachments:
+                    if (
+                        attachment.content_type == "application/vnd.microsoft.card.adaptive"
+                        and attachment.content
+                    ):
+                        card_inputs = DirectLineService._extract_card_inputs(attachment.content)
+                        if card_inputs:
+                            pending_card_inputs.extend(card_inputs)
+
                 text = activity.text
                 if not text:
-                    # Attempt to extract readable text from adaptive card / hero card attachments
                     for attachment in activity.attachments:
                         extracted = self._extract_attachment_text(attachment)
                         if extracted:
@@ -246,7 +258,7 @@ class DirectLineService:
         if not messages:
             raise DirectLineReceiveTimeoutError("No bot messages received within polling timeout")
 
-        return messages, current_watermark
+        return messages, current_watermark, pending_card_inputs
 
     @staticmethod
     def _extract_attachment_text(attachment: DirectLineAttachment) -> str | None:
@@ -283,7 +295,13 @@ class DirectLineService:
 
     @staticmethod
     def _extract_adaptive_card_text(content: dict) -> str | None:
-        """Recursively pull TextBlock / FactSet text out of an Adaptive Card body."""
+        """Recursively pull human-readable text out of an Adaptive Card body.
+
+        Includes:
+        - TextBlock text
+        - FactSet entries
+        - Input.* label + current value (or placeholder prompt)
+        """
         lines: list[str] = []
 
         def _collect(elements: list) -> None:
@@ -303,8 +321,77 @@ class DirectLineService:
                             lines.append(f"{title}: {value}")
                         elif value:
                             lines.append(value)
+                elif elem_type.startswith("Input."):
+                    field_id = element.get("id", "")
+                    label = element.get("label") or field_id
+                    value = element.get("value")
+                    placeholder = element.get("placeholder")
+                    if label:
+                        if value is not None and str(value).strip() != "":
+                            lines.append(f"{label}: {value}")
+                        elif placeholder:
+                            lines.append(f"{label}: {placeholder}")
+                elif elem_type in ("Container", "Column", "ColumnSet"):
+                    _collect(element.get("items", []))
+                    _collect(element.get("columns", []))
+
+        _collect(content.get("body", []))
+        return "\n".join(lines) if lines else None
+
+    @staticmethod
+    def _extract_card_inputs(content: dict) -> list[dict]:
+        """Extract Input.* field definitions from an Adaptive Card body.
+
+        If Action.Submit includes hidden "data", it is attached to each input entry so
+        submit emulation can preserve required metadata.
+        """
+        inputs: list[dict] = []
+        submit_action_data: dict = {}
+
+        def _collect(elements: list) -> None:
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                elem_type = element.get("type", "")
+                if elem_type.startswith("Input."):
+                    field_id = element.get("id")
+                    if field_id:
+                        inputs.append(
+                            {
+                                "id": field_id,
+                                "type": elem_type,
+                                "label": element.get("label"),
+                                "value": element.get("value"),
+                                "placeholder": element.get("placeholder"),
+                            }
+                        )
                 elif elem_type in ("Container", "Column", "ColumnSet"):
                     _collect(element.get("items", []) or element.get("columns", []))
 
         _collect(content.get("body", []))
-        return "\n".join(lines) if lines else None
+
+        actions = content.get("actions", [])
+        if isinstance(actions, list):
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                if action.get("type") == "Action.Submit":
+                    raw_data = action.get("data")
+                    if isinstance(raw_data, dict):
+                        submit_action_data = dict(raw_data)
+                    break
+
+        if submit_action_data:
+            for item in inputs:
+                item["action_data"] = submit_action_data
+
+        if not inputs and submit_action_data:
+            inputs.append(
+                {
+                    "id": None,
+                    "type": "Action.Submit",
+                    "action_data": submit_action_data,
+                }
+            )
+
+        return inputs

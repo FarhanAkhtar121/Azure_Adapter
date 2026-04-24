@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
@@ -98,6 +99,51 @@ class BackgroundProcessor:
                 mapping = await repo.upsert_mapping(mapping)
                 mapping_id = mapping.id
 
+                # Emulate Action.Submit: if the previous bot reply had an adaptive card
+                # with input fields, map the user's text to those field IDs so Copilot
+                # Studio receives a structured form value rather than plain text.
+                meta = dict(mapping.metadata_json or {})
+                pending_card_inputs: list[dict] = meta.pop("pending_card_inputs", None) or []
+                submit_value: dict | None = None
+                outbound_text = normalized.user_text
+                if pending_card_inputs:
+                    action_data: dict = {}
+                    for inp in pending_card_inputs:
+                        raw_action_data = inp.get("action_data")
+                        if isinstance(raw_action_data, dict):
+                            action_data.update(raw_action_data)
+
+                    submit_value = dict(action_data)
+
+                    # Preserve defaults from card values when present.
+                    for inp in pending_card_inputs:
+                        field_id = inp.get("id")
+                        default_value = inp.get("value")
+                        if field_id and default_value is not None and str(default_value).strip() != "":
+                            submit_value[field_id] = default_value
+
+                    field_ids = [inp.get("id") for inp in pending_card_inputs if inp.get("id")]
+                    parsed_updates = self._parse_structured_card_reply(normalized.user_text, pending_card_inputs)
+                    if parsed_updates:
+                        submit_value.update(parsed_updates)
+                    elif len(field_ids) == 1:
+                        submit_value[field_ids[0]] = normalized.user_text
+
+                    # Submit-style activity: preserve value payload; text is optional.
+                    outbound_text = ""
+                    mapping.metadata_json = meta
+                    logger.info(
+                        "Emulating card Action.Submit for user reply",
+                        extra={
+                            "extra": {
+                                "input_ids": [inp.get("id") for inp in pending_card_inputs if inp.get("id")],
+                                "action_data_keys": sorted(action_data.keys()),
+                                "parsed_update_keys": sorted(parsed_updates.keys()) if parsed_updates else [],
+                                "value_keys": sorted(submit_value.keys()),
+                            }
+                        },
+                    )
+
                 user_from_id = f"zoom:{normalized.zoom_user_id}"
                 _send_metadata = {
                     "zoom_user_id": normalized.zoom_user_id,
@@ -109,10 +155,11 @@ class BackgroundProcessor:
                     await self._directline.send_message(
                         conversation_id=mapping.directline_conversation_id,
                         token=mapping.directline_token,
-                        text=normalized.user_text,
+                        text=outbound_text,
                         from_id=user_from_id,
                         locale=normalized.locale,
                         metadata=_send_metadata,
+                        value=submit_value,
                     )
                 except DirectLineConversationExpiredError:
                     logger.warning(
@@ -130,18 +177,32 @@ class BackgroundProcessor:
                     await self._directline.send_message(
                         conversation_id=mapping.directline_conversation_id,
                         token=mapping.directline_token,
-                        text=normalized.user_text,
+                        text=outbound_text,
                         from_id=user_from_id,
                         locale=normalized.locale,
                         metadata=_send_metadata,
+                        value=submit_value,
                     )
 
-                bot_messages, watermark = await self._directline.poll_for_bot_reply(
+                bot_messages, watermark, detected_inputs = await self._directline.poll_for_bot_reply(
                     conversation_id=mapping.directline_conversation_id,
                     token=mapping.directline_token,
                     watermark=mapping.watermark,
                     user_from_id=user_from_id,
                 )
+
+                if detected_inputs:
+                    meta = dict(mapping.metadata_json or {})
+                    meta["pending_card_inputs"] = detected_inputs
+                    mapping.metadata_json = meta
+                    logger.info(
+                        "Adaptive card inputs detected — will emulate Action.Submit on next reply",
+                        extra={
+                            "extra": {
+                                "input_ids": [inp.get("id") for inp in detected_inputs if inp.get("id")],
+                            }
+                        },
+                    )
 
                 access_token = await self._zoom_auth.get_chatbot_access_token()
                 for message in bot_messages:
@@ -275,3 +336,66 @@ class BackgroundProcessor:
         metadata["last_outbound_text"] = message
         metadata["last_outbound_at"] = datetime.now(timezone.utc).isoformat()
         mapping.metadata_json = metadata
+
+    @staticmethod
+    def _parse_structured_card_reply(user_text: str, inputs: list[dict]) -> dict[str, str]:
+        """Parse a user reply into per-field values for multi-input adaptive cards.
+
+        Supports:
+        - JSON object: {"field_id": "value"}
+        - Key-value lines: field: value
+        - Keys matching input id or label (case-insensitive)
+        """
+        text = (user_text or "").strip()
+        if not text:
+            return {}
+
+        alias_to_id: dict[str, str] = {}
+        for inp in inputs:
+            field_id = inp.get("id")
+            if not field_id:
+                continue
+            alias_to_id[field_id.strip().lower()] = field_id
+            label = inp.get("label")
+            if isinstance(label, str) and label.strip():
+                alias_to_id[label.strip().lower()] = field_id
+
+        def _normalize_key(k: str) -> str:
+            return " ".join(k.replace("_", " ").split()).strip().lower()
+
+        normalized_aliases = {_normalize_key(k): v for k, v in alias_to_id.items()}
+
+        updates: dict[str, str] = {}
+
+        # JSON object payload
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict):
+                for raw_key, raw_value in obj.items():
+                    if not isinstance(raw_key, str):
+                        continue
+                    mapped = alias_to_id.get(raw_key.strip().lower()) or normalized_aliases.get(
+                        _normalize_key(raw_key)
+                    )
+                    if mapped is not None and raw_value is not None:
+                        updates[mapped] = str(raw_value)
+                if updates:
+                    return updates
+
+        # Key-value lines
+        for line in text.splitlines():
+            if ":" not in line:
+                continue
+            raw_key, raw_value = line.split(":", 1)
+            key = raw_key.strip()
+            value = raw_value.strip()
+            if not key or not value:
+                continue
+            mapped = alias_to_id.get(key.lower()) or normalized_aliases.get(_normalize_key(key))
+            if mapped:
+                updates[mapped] = value
+
+        return updates
