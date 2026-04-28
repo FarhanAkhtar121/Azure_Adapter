@@ -125,3 +125,24 @@ def test_normalize_interactive_message_actions_event() -> None:
     assert normalized.zoom_channel_id == "c1"
     assert normalized.zoom_thread_id == "root"
     assert normalized.raw_metadata["submit_action_value"] == normalized.user_text
+
+
+def test_normalize_plain_text_input_ignores_label_text_without_value() -> None:
+    router = MessageRouterService(Settings(ZOOM_BOT_JID="bot@xmpp.zoom.us"))
+    payload = {
+        "event": "team_chat.plain_text_input",
+        "payload": {
+            "user_id": "u1",
+            "to_jid": "tojid",
+            "channel_id": "c1",
+            "object": {
+                "input": {
+                    "action_id": "userClarificationResponse",
+                    "text": "Your answers",
+                }
+            },
+        },
+    }
+
+    # No actual value/input_value present; should be ignored.
+    assert router.normalize(payload) is None

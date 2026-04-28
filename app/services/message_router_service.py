@@ -164,7 +164,17 @@ class MessageRouterService:
             input_obj = source.get("input") if isinstance(source, dict) else None
             if isinstance(input_obj, dict):
                 action_id = input_obj.get("action_id") or input_obj.get("actionId")
-                value = input_obj.get("value") or input_obj.get("text") or input_obj.get("input_value")
+                value = (
+                    input_obj.get("value")
+                    or input_obj.get("input_value")
+                    or input_obj.get("inputValue")
+                )
+                if isinstance(action_id, str) and isinstance(value, str) and value.strip():
+                    return action_id.strip(), value.strip()
+
+            if isinstance(source, dict):
+                action_id = source.get("action_id") or source.get("actionId")
+                value = source.get("value") or source.get("input_value") or source.get("inputValue")
                 if isinstance(action_id, str) and isinstance(value, str) and value.strip():
                     return action_id.strip(), value.strip()
 
@@ -172,7 +182,7 @@ class MessageRouterService:
         def _scan(node: object) -> tuple[str | None, str | None]:
             if isinstance(node, dict):
                 action_id = node.get("action_id") or node.get("actionId")
-                value = node.get("value") or node.get("text") or node.get("input_value")
+                value = node.get("value") or node.get("input_value") or node.get("inputValue")
                 if isinstance(action_id, str) and isinstance(value, str) and value.strip():
                     return action_id.strip(), value.strip()
                 for v in node.values():

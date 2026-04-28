@@ -119,7 +119,25 @@ class BackgroundProcessor:
                     input_value = normalized.raw_metadata.get("input_value")
                     valid_field_ids = {inp.get("id") for inp in pending_card_inputs if inp.get("id")}
 
-                    if isinstance(action_id, str) and action_id in valid_field_ids and isinstance(input_value, str):
+                    input_label = None
+                    for inp in pending_card_inputs:
+                        if inp.get("id") == action_id:
+                            input_label = inp.get("label")
+                            break
+
+                    is_label_echo = (
+                        isinstance(input_label, str)
+                        and isinstance(input_value, str)
+                        and input_label.strip().lower() == input_value.strip().lower()
+                    )
+
+                    if (
+                        isinstance(action_id, str)
+                        and action_id in valid_field_ids
+                        and isinstance(input_value, str)
+                        and input_value.strip()
+                        and not is_label_echo
+                    ):
                         cached_overrides[action_id] = input_value
                         meta["card_input_overrides"] = cached_overrides
                         meta["pending_card_inputs"] = pending_card_inputs
@@ -143,6 +161,7 @@ class BackgroundProcessor:
                                     "event_type": normalized.event_type,
                                     "action_id": action_id,
                                     "has_pending_inputs": bool(pending_card_inputs),
+                                    "is_label_echo": is_label_echo,
                                 }
                             },
                         )
@@ -186,9 +205,17 @@ class BackgroundProcessor:
                                     submit_value[key] = str(value)
 
                         # Cached plain_text_input edits are authoritative.
+                        applied_overrides = {
+                            key: value for key, value in cached_overrides.items() if key in field_ids
+                        }
                         for key, value in cached_overrides.items():
                             if key in field_ids:
                                 submit_value[key] = value
+
+                        logger.info(
+                            "Submit overrides applied",
+                            extra={"extra": {"applied_overrides": applied_overrides}},
+                        )
 
                         outbound_text = ""
                         meta.pop("pending_card_inputs", None)
@@ -230,9 +257,17 @@ class BackgroundProcessor:
                         submit_value[field_ids[0]] = normalized.user_text
 
                     if cached_overrides:
+                        applied_overrides = {
+                            key: value for key, value in cached_overrides.items() if key in field_ids
+                        }
                         for key, value in cached_overrides.items():
                             if key in field_ids:
                                 submit_value[key] = value
+
+                        logger.info(
+                            "Submit overrides applied",
+                            extra={"extra": {"applied_overrides": applied_overrides}},
+                        )
 
                     # Submit-style activity: preserve value payload; text is optional.
                     outbound_text = ""
