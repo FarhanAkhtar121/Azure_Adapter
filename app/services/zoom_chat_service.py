@@ -9,6 +9,9 @@ from app.schemas.zoom import (
     ZoomReplyBodyItem,
     ZoomReplyContent,
     ZoomReplyHead,
+    ZoomRichContent,
+    ZoomRichHead,
+    ZoomRichMessageRequest,
 )
 
 
@@ -82,4 +85,76 @@ class ZoomChatService:
         if response.status_code >= 400:
             raise ZoomReplyError(
                 f"Zoom chatbot message send failed with status {response.status_code}: {response.text}"
+            )
+
+    def build_rich_message_payload(
+        self,
+        to_jid: str,
+        content: dict,
+        user_jid: str,
+        account_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> ZoomRichMessageRequest:
+        """Build a Zoom chatbot interactive/rich message payload from a pre-built content dict."""
+        if not self._settings.zoom_bot_jid:
+            raise ZoomReplyError("ZOOM_BOT_JID is not configured")
+
+        resolved_account_id = account_id or self._settings.zoom_account_id
+        if not resolved_account_id:
+            raise ZoomReplyError("Zoom account_id is missing for chatbot send")
+
+        if not to_jid:
+            raise ZoomReplyError("Zoom to_jid is missing for chatbot send")
+
+        if not user_jid:
+            raise ZoomReplyError("Zoom user_jid is missing for chatbot send")
+
+        head_data = content.get("head", {})
+        rich_head = ZoomRichHead(
+            text=head_data.get("text", ""),
+            sub_head=head_data.get("sub_head"),
+        )
+        rich_content = ZoomRichContent(
+            head=rich_head,
+            body=content.get("body", []),
+            settings=content.get("settings", {}),
+        )
+        return ZoomRichMessageRequest(
+            robot_jid=self._settings.zoom_bot_jid,
+            to_jid=to_jid,
+            account_id=resolved_account_id,
+            user_jid=user_jid,
+            content=rich_content,
+            thread_id=thread_id,
+        )
+
+    async def send_rich_message(
+        self,
+        access_token: str,
+        to_jid: str,
+        content: dict,
+        user_jid: str,
+        account_id: str | None = None,
+    ) -> None:
+        """Send a Zoom Team Chat chatbot message using the native interactive card format."""
+        payload = self.build_rich_message_payload(
+            to_jid=to_jid,
+            content=content,
+            user_jid=user_jid,
+            account_id=account_id,
+        )
+
+        url = f"{self._base}/v2/im/chat/messages"
+        response = await self._client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=payload.model_dump(exclude_none=True),
+        )
+
+        if response.status_code >= 400:
+            raise ZoomReplyError(
+                f"Zoom chatbot rich message send failed with status {response.status_code}: {response.text}"
             )

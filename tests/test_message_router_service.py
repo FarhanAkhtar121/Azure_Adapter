@@ -66,3 +66,62 @@ def test_normalize_uses_stable_root_thread_when_thread_missing() -> None:
     assert normalized_first.zoom_thread_id == "root"
     assert normalized_second.zoom_thread_id == "root"
     assert normalized_first.zoom_thread_id == normalized_second.zoom_thread_id
+
+
+def test_normalize_team_chat_plain_text_input_event() -> None:
+    router = MessageRouterService(Settings(ZOOM_BOT_JID="bot@xmpp.zoom.us"))
+    payload = {
+        "event": "team_chat.plain_text_input",
+        "payload": {
+            "user_id": "u1",
+            "to_jid": "tojid",
+            "channel_id": "c1",
+            "object": {
+                "input": {
+                    "action_id": "userClarificationResponse",
+                    "value": "I am using windows 11 in UMG network",
+                }
+            },
+        },
+    }
+
+    normalized = router.normalize(payload)
+
+    assert normalized is not None
+    assert normalized.event_type == "team_chat.plain_text_input"
+    assert normalized.user_text == "I am using windows 11 in UMG network"
+    assert normalized.zoom_user_id == "u1"
+    assert normalized.zoom_channel_id == "c1"
+    assert normalized.zoom_thread_id == "root"
+    assert normalized.raw_metadata["input_action_id"] == "userClarificationResponse"
+    assert normalized.raw_metadata["input_value"] == "I am using windows 11 in UMG network"
+
+
+def test_normalize_interactive_message_actions_event() -> None:
+    router = MessageRouterService(Settings(ZOOM_BOT_JID="bot@xmpp.zoom.us"))
+    payload = {
+        "event": "interactive_message_actions",
+        "payload": {
+            "user_id": "u1",
+            "to_jid": "tojid",
+            "channel_id": "c1",
+            "object": {
+                "actions": [
+                    {
+                        "text": "Submit details",
+                        "value": '{"zoom_action":"submit_card","input_values":{"userClarificationResponse":"I am using windows 11"},"action_data":{"ticketStage":"clarification"}}',
+                    }
+                ]
+            },
+        },
+    }
+
+    normalized = router.normalize(payload)
+
+    assert normalized is not None
+    assert normalized.event_type == "interactive_message_actions"
+    assert normalized.user_text.startswith('{"zoom_action":"submit_card"')
+    assert normalized.zoom_user_id == "u1"
+    assert normalized.zoom_channel_id == "c1"
+    assert normalized.zoom_thread_id == "root"
+    assert normalized.raw_metadata["submit_action_value"] == normalized.user_text

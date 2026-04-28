@@ -85,7 +85,7 @@ async def test_send_and_poll_directline() -> None:
     )
     assert activity_id == "activity-id"
 
-    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -94,6 +94,7 @@ async def test_send_and_poll_directline() -> None:
     assert messages == ["hi there"]
     assert watermark == "2"
     assert pending_inputs == []
+    assert zoom_cards == [None]
 
     await client.aclose()
 
@@ -142,7 +143,7 @@ async def test_poll_extracts_adaptive_card_fallback_text() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2, DEBUG_TRANSCRIPT_LOGGING=True)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -152,6 +153,9 @@ async def test_poll_extracts_adaptive_card_fallback_text() -> None:
     assert messages == ["Your ticket has been created.\nTicket ID: INC001\nStatus: Open"]
     assert watermark == "1"
     assert pending_inputs == []
+    # FactSet content now maps to a Zoom fields section.
+    assert zoom_cards[0] is not None
+    assert zoom_cards[0]["head"]["text"] == "Your ticket has been created."
 
     await client.aclose()
 
@@ -191,7 +195,7 @@ async def test_poll_extracts_hero_card_text() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -201,6 +205,7 @@ async def test_poll_extracts_hero_card_text() -> None:
     assert messages == ["Ticket Created\nINC001\nYour request has been logged."]
     assert watermark == "1"
     assert pending_inputs == []
+    assert zoom_cards == [None]
 
     await client.aclose()
 
@@ -243,7 +248,7 @@ async def test_poll_detects_adaptive_card_inputs_for_submit() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
         conversation_id="conv1", token="token", watermark=None, user_from_id="zoom:u1",
     )
 
@@ -255,9 +260,13 @@ async def test_poll_detects_adaptive_card_inputs_for_submit() -> None:
             "label": None,
             "value": None,
             "placeholder": None,
+            "isMultiline": True,
             "action_data": {"ticketStage": "clarification", "flowId": "abc123"},
         }
     ]
+    # Card has inputs + Action.Submit → Zoom card should be built
+    assert zoom_cards[0] is not None
+    assert zoom_cards[0]["head"]["text"] == "Please answer the following questions:"
     await client.aclose()
 
 
@@ -309,7 +318,7 @@ async def test_poll_renders_adaptive_card_input_values() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -321,5 +330,93 @@ async def test_poll_renders_adaptive_card_input_values() -> None:
     ]
     assert watermark == "1"
     assert pending_inputs[0]["id"] == "confirmed_short_description"
-
+    # Prefilled edit cards should render as editable-only (no duplicate display fields).
+    card = zoom_cards[0]
+    assert card is not None
+    assert card["head"]["text"] == "Review and Edit Ticket Details"
+    assert not any(
+        section.get("type") == "section" and any(sub.get("type") == "fields" for sub in section.get("sections", []))
+        for section in card["body"]
+    )
+    editable_inputs = [item for item in card["body"] if item.get("type") == "plain_text_input"]
+    assert len(editable_inputs) == 2
     await client.aclose()
+
+
+def test_build_zoom_card_content_submit_encodes_postback() -> None:
+    """_build_zoom_card_content should produce a valid Zoom card dict with a JSON-encoded
+    submit button value containing the card inputs and Action.Submit hidden data."""
+    import json
+
+    content = {
+        "type": "AdaptiveCard",
+        "body": [
+            {"type": "TextBlock", "text": "🧐 We need a bit more information", "weight": "Bolder"},
+            {"type": "TextBlock", "text": "Please answer the questions below:"},
+            {"type": "Input.Text", "id": "userClarificationResponse", "label": "Your answers",
+             "placeholder": "Answer each question...", "isMultiline": True},
+        ],
+        "actions": [
+            {"type": "Action.Submit", "title": "Submit details",
+             "data": {"ticketStage": "clarification"}},
+        ],
+    }
+    card_inputs = DirectLineService._extract_card_inputs(content)
+    result = DirectLineService._build_zoom_card_content(content, card_inputs)
+
+    assert result is not None
+    assert result["head"]["text"] == "🧐 We need a bit more information"
+    assert result["head"]["sub_head"]["text"] == "Please answer the questions below:"
+
+    # Should have a plain_text_input for the Input.Text field
+    plain_input = next(item for item in result["body"] if item.get("type") == "plain_text_input")
+    assert plain_input["action_id"] == "userClarificationResponse"
+    assert plain_input["text"] == "Your answers"
+    assert plain_input["placeholder"] == "Answer each question..."
+    assert plain_input["multiline"] is True
+
+    # Should have an actions section with a submit button
+    action_section = next(
+        item for item in result["body"]
+        if item.get("type") == "section" and
+        any(s.get("type") == "actions" for s in item.get("sections", []))
+    )
+    actions_subsection = next(s for s in action_section["sections"] if s.get("type") == "actions")
+    button = actions_subsection["items"][0]
+    assert button["text"] == "Submit details"
+
+    button_value = json.loads(button["value"])
+    assert button_value["zoom_action"] == "submit_card"
+    assert button_value["action_data"] == {"ticketStage": "clarification"}
+    assert "input_values" not in button_value
+
+
+def test_build_zoom_card_content_open_url() -> None:
+    """Action.OpenUrl should be rendered as a markdown link in a message section."""
+    content = {
+        "type": "AdaptiveCard",
+        "body": [{"type": "TextBlock", "text": "View your ticket"}],
+        "actions": [{"type": "Action.OpenUrl", "title": "Open Portal", "url": "https://portal.example.com"}],
+    }
+    result = DirectLineService._build_zoom_card_content(content, [])
+
+    assert result is not None
+    link_section = next(
+        item for item in result["body"]
+        if item.get("type") == "section" and
+        any("Open Portal" in s.get("text", "") for s in item.get("sections", []))
+    )
+    link_text = next(s["text"] for s in link_section["sections"] if "Open Portal" in s.get("text", ""))
+    assert "[Open Portal](https://portal.example.com)" in link_text
+
+
+def test_build_zoom_card_content_returns_none_without_title() -> None:
+    """Cards with no TextBlock body should not produce a Zoom card (fall through to text)."""
+    content = {
+        "type": "AdaptiveCard",
+        "body": [
+            {"type": "FactSet", "facts": [{"title": "Status", "value": "Open"}]},
+        ],
+    }
+    result = DirectLineService._build_zoom_card_content(content, [])
+    assert result is None

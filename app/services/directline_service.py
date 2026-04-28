@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 
 import httpx
@@ -152,13 +153,14 @@ class DirectLineService:
         token: str,
         watermark: str | None,
         user_from_id: str,
-    ) -> tuple[list[str], str | None, list[dict]]:
+    ) -> tuple[list[str], list[dict | None], str | None, list[dict]]:
         timeout_seconds = self._settings.poll_timeout_seconds
         interval = self._settings.poll_interval_seconds
 
         start = asyncio.get_event_loop().time()
         seen_ids: set[str] = set()
         messages: list[str] = []
+        zoom_cards: list[dict | None] = []
         current_watermark = watermark
         got_first_bot_reply = False
         pending_card_inputs: list[dict] = []
@@ -207,6 +209,7 @@ class DirectLineService:
                 if sender == user_from_id:
                     continue
 
+                activity_zoom_card: dict | None = None
                 for attachment in activity.attachments:
                     if (
                         attachment.content_type == "application/vnd.microsoft.card.adaptive"
@@ -215,6 +218,12 @@ class DirectLineService:
                         card_inputs = DirectLineService._extract_card_inputs(attachment.content)
                         if card_inputs:
                             pending_card_inputs.extend(card_inputs)
+                        if activity_zoom_card is None:
+                            built = DirectLineService._build_zoom_card_content(
+                                attachment.content, card_inputs
+                            )
+                            if built:
+                                activity_zoom_card = built
 
                 text = activity.text
                 if not text:
@@ -236,6 +245,7 @@ class DirectLineService:
 
                 if text:
                     messages.append(text)
+                    zoom_cards.append(activity_zoom_card)
                     new_bot_messages += 1
                 else:
                     logger.warning(
@@ -258,7 +268,7 @@ class DirectLineService:
         if not messages:
             raise DirectLineReceiveTimeoutError("No bot messages received within polling timeout")
 
-        return messages, current_watermark, pending_card_inputs
+        return messages, zoom_cards, current_watermark, pending_card_inputs
 
     @staticmethod
     def _extract_attachment_text(attachment: DirectLineAttachment) -> str | None:
@@ -363,6 +373,7 @@ class DirectLineService:
                                 "label": element.get("label"),
                                 "value": element.get("value"),
                                 "placeholder": element.get("placeholder"),
+                                "isMultiline": element.get("isMultiline", False),
                             }
                         )
                 elif elem_type in ("Container", "Column", "ColumnSet"):
@@ -395,3 +406,164 @@ class DirectLineService:
             )
 
         return inputs
+
+    @staticmethod
+    def _build_zoom_card_content(content: dict, card_inputs: list[dict]) -> dict | None:
+        """Transform an Adaptive Card into a Zoom Team Chat interactive message content dict.
+
+        Mapping:
+        - First TextBlock       → head.text
+        - Second TextBlock      → head.sub_head.text
+        - Further TextBlocks    → body message section
+        - FactSet               → body fields section
+        - Input.* with value    → body fields display + plain_text_input
+        - Input.* no value      → body plain_text_input only
+        - Action.Submit         → body actions button (encodes submit intent as JSON value)
+        - Action.OpenUrl        → body message section with markdown link
+
+        Returns None if the card cannot be meaningfully represented (e.g., no title).
+        """
+        body: list[dict] = []
+        head_text: str = ""
+        sub_head_text: str = ""
+        extra_text_lines: list[str] = []
+        field_display_items: list[dict] = []
+
+        def _walk(elements: list) -> None:
+            nonlocal head_text, sub_head_text
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                elem_type = element.get("type", "")
+                if elem_type == "TextBlock":
+                    t = element.get("text", "").strip()
+                    if not t:
+                        continue
+                    if not head_text:
+                        head_text = t
+                    elif not sub_head_text:
+                        sub_head_text = t
+                    else:
+                        extra_text_lines.append(t)
+                elif elem_type == "FactSet":
+                    for fact in element.get("facts", []):
+                        title = fact.get("title", "")
+                        value = fact.get("value", "")
+                        if title and value:
+                            field_display_items.append({"key": title, "value": str(value), "short": True})
+                elif elem_type in ("Container", "Column", "ColumnSet"):
+                    _walk(element.get("items", []))
+                    _walk(element.get("columns", []))
+
+        _walk(content.get("body", []))
+
+        if not head_text:
+            return None
+
+        has_prefilled_inputs = any(
+            inp.get("id") and inp.get("value") is not None and str(inp.get("value")).strip() != ""
+            for inp in card_inputs
+        )
+
+        # Collect input field current values for display
+        if not has_prefilled_inputs:
+            for inp in card_inputs:
+                inp_id = inp.get("id")
+                if not inp_id:
+                    continue
+                label = inp.get("label") or inp_id
+                value = inp.get("value")
+                if value is not None and str(value).strip():
+                    field_display_items.append({"key": label, "value": str(value), "short": True})
+
+        # Add extra body text as a message section
+        if extra_text_lines and not has_prefilled_inputs:
+            body.append({
+                "type": "section",
+                "sections": [{"type": "message", "text": "\n".join(extra_text_lines)}],
+            })
+
+        # Add current-value display for FactSet entries and pre-filled inputs
+        if field_display_items and not has_prefilled_inputs:
+            body.append({
+                "type": "section",
+                "sections": [{"type": "fields", "items": field_display_items}],
+            })
+
+        # Add a plain_text_input for each editable input field
+        for inp in card_inputs:
+            inp_id = inp.get("id")
+            if not inp_id:
+                continue
+            label = inp.get("label") or inp_id
+            value = inp.get("value") or ""
+            placeholder = inp.get("placeholder") or ""
+            is_multiline = bool(inp.get("isMultiline", False))
+            body.append({
+                "type": "plain_text_input",
+                "action_id": inp_id,
+                "text": label,
+                "value": str(value),
+                "placeholder": placeholder,
+                "multiline": is_multiline,
+                "min_length": 0,
+                "max_length": 2000,
+            })
+
+        # Collect hidden Action.Submit data from inputs (already extracted)
+        action_data: dict = {}
+        for inp in card_inputs:
+            raw = inp.get("action_data")
+            if isinstance(raw, dict):
+                action_data.update(raw)
+
+        # Process actions: submit buttons + open-url markdown links
+        action_buttons: list[dict] = []
+        open_url_links: list[str] = []
+
+        for action in content.get("actions", []):
+            if not isinstance(action, dict):
+                continue
+            action_type = action.get("type")
+            title = action.get("title", "Submit")
+            if action_type == "Action.Submit":
+                button_value = json.dumps(
+                    {
+                        "zoom_action": "submit_card",
+                        "action_data": action_data,
+                    },
+                    separators=(",", ":"),
+                )
+                action_buttons.append({"text": title, "value": button_value})
+            elif action_type == "Action.OpenUrl":
+                url = action.get("url", "")
+                if url:
+                    open_url_links.append(f"[{title}]({url})")
+
+        if open_url_links:
+            body.append({
+                "type": "section",
+                "sections": [{"type": "message", "text": "  ".join(open_url_links)}],
+            })
+
+        if action_buttons:
+            has_editable_inputs = any(inp.get("id") for inp in card_inputs)
+            prompt = (
+                "Type edited values to change fields, then press Submit"
+                if has_editable_inputs
+                else "Press Submit when ready"
+            )
+            body.append({
+                "type": "section",
+                "layout": "horizontal",
+                "sections": [
+                    {"type": "message", "text": prompt},
+                    {"type": "actions", "items": action_buttons},
+                ],
+            })
+
+        head: dict = {"text": head_text}
+        if sub_head_text:
+            head["sub_head"] = {"text": sub_head_text}
+
+        return {"head": head, "body": body}

@@ -103,9 +103,109 @@ class BackgroundProcessor:
                 # with input fields, map the user's text to those field IDs so Copilot
                 # Studio receives a structured form value rather than plain text.
                 meta = dict(mapping.metadata_json or {})
-                pending_card_inputs: list[dict] = meta.pop("pending_card_inputs", None) or []
+                pending_card_inputs: list[dict] = meta.get("pending_card_inputs", None) or []
+                cached_overrides: dict[str, str] = {
+                    k: str(v)
+                    for k, v in (meta.get("card_input_overrides") or {}).items()
+                    if isinstance(k, str)
+                }
                 submit_value: dict | None = None
                 outbound_text = normalized.user_text
+
+                # Plain-text input events are edit-state updates from Zoom card fields.
+                # Do not send them to Direct Line as standalone user messages.
+                if normalized.event_type == "team_chat.plain_text_input":
+                    action_id = normalized.raw_metadata.get("input_action_id")
+                    input_value = normalized.raw_metadata.get("input_value")
+                    valid_field_ids = {inp.get("id") for inp in pending_card_inputs if inp.get("id")}
+
+                    if isinstance(action_id, str) and action_id in valid_field_ids and isinstance(input_value, str):
+                        cached_overrides[action_id] = input_value
+                        meta["card_input_overrides"] = cached_overrides
+                        meta["pending_card_inputs"] = pending_card_inputs
+                        mapping.metadata_json = meta
+                        await repo.upsert_mapping(mapping)
+                        logger.info(
+                            "Captured Zoom plain_text_input edit for pending card",
+                            extra={
+                                "extra": {
+                                    "event_type": normalized.event_type,
+                                    "action_id": action_id,
+                                    "cached_override_keys": sorted(cached_overrides.keys()),
+                                }
+                            },
+                        )
+                    else:
+                        logger.info(
+                            "Ignoring plain_text_input without actionable pending input context",
+                            extra={
+                                "extra": {
+                                    "event_type": normalized.event_type,
+                                    "action_id": action_id,
+                                    "has_pending_inputs": bool(pending_card_inputs),
+                                }
+                            },
+                        )
+                    return
+
+                # --- Button postback: user clicked a rendered Action.Submit button --------
+                # The Zoom button value encodes the submit intent as a compact JSON string
+                # like {"zoom_action":"submit_card","input_values":{...},"action_data":{...}}
+                # Detect this and build the submit payload directly, bypassing text parsing.
+                if pending_card_inputs and normalized.user_text.startswith('{"zoom_action":'):
+                    try:
+                        postback = json.loads(normalized.user_text)
+                    except (json.JSONDecodeError, ValueError):
+                        postback = {}
+
+                    if isinstance(postback, dict) and postback.get("zoom_action") == "submit_card":
+                        action_data: dict = {}
+                        for inp in pending_card_inputs:
+                            raw_action_data = inp.get("action_data")
+                            if isinstance(raw_action_data, dict):
+                                action_data.update(raw_action_data)
+
+                        postback_action_data = postback.get("action_data")
+                        if isinstance(postback_action_data, dict):
+                            action_data.update({k: v for k, v in postback_action_data.items() if isinstance(k, str)})
+
+                        submit_value = dict(action_data)
+                        field_ids = [inp.get("id") for inp in pending_card_inputs if inp.get("id")]
+
+                        # Preserve defaults shown in the card first.
+                        for inp in pending_card_inputs:
+                            field_id = inp.get("id")
+                            default_value = inp.get("value")
+                            if field_id and default_value is not None and str(default_value).strip() != "":
+                                submit_value[field_id] = default_value
+
+                        postback_inputs = postback.get("input_values")
+                        if isinstance(postback_inputs, dict):
+                            for key, value in postback_inputs.items():
+                                if isinstance(key, str) and key in field_ids and value is not None:
+                                    submit_value[key] = str(value)
+
+                        # Cached plain_text_input edits are authoritative.
+                        for key, value in cached_overrides.items():
+                            if key in field_ids:
+                                submit_value[key] = value
+
+                        outbound_text = ""
+                        meta.pop("pending_card_inputs", None)
+                        meta.pop("card_input_overrides", None)
+                        mapping.metadata_json = meta
+                        logger.info(
+                            "Zoom submit button clicked — using encoded card values",
+                            extra={
+                                "extra": {
+                                    "cached_override_keys": sorted(cached_overrides.keys()),
+                                    "value_keys": sorted(submit_value.keys()),
+                                }
+                            },
+                        )
+                        pending_card_inputs = []  # consumed; skip text-parse block below
+                # -------------------------------------------------------------------------
+
                 if pending_card_inputs:
                     action_data: dict = {}
                     for inp in pending_card_inputs:
@@ -129,8 +229,15 @@ class BackgroundProcessor:
                     elif len(field_ids) == 1:
                         submit_value[field_ids[0]] = normalized.user_text
 
+                    if cached_overrides:
+                        for key, value in cached_overrides.items():
+                            if key in field_ids:
+                                submit_value[key] = value
+
                     # Submit-style activity: preserve value payload; text is optional.
                     outbound_text = ""
+                    meta.pop("pending_card_inputs", None)
+                    meta.pop("card_input_overrides", None)
                     mapping.metadata_json = meta
                     logger.info(
                         "Emulating card Action.Submit for user reply",
@@ -139,6 +246,7 @@ class BackgroundProcessor:
                                 "input_ids": [inp.get("id") for inp in pending_card_inputs if inp.get("id")],
                                 "action_data_keys": sorted(action_data.keys()),
                                 "parsed_update_keys": sorted(parsed_updates.keys()) if parsed_updates else [],
+                                "cached_override_keys": sorted(cached_overrides.keys()),
                                 "value_keys": sorted(submit_value.keys()),
                             }
                         },
@@ -184,7 +292,7 @@ class BackgroundProcessor:
                         value=submit_value,
                     )
 
-                bot_messages, watermark, detected_inputs = await self._directline.poll_for_bot_reply(
+                bot_messages, zoom_card_contents, watermark, detected_inputs = await self._directline.poll_for_bot_reply(
                     conversation_id=mapping.directline_conversation_id,
                     token=mapping.directline_token,
                     watermark=mapping.watermark,
@@ -205,14 +313,27 @@ class BackgroundProcessor:
                     )
 
                 access_token = await self._zoom_auth.get_chatbot_access_token()
-                for message in bot_messages:
-                    await self._zoom_chat.send_text_message(
-                        access_token=access_token,
-                        to_jid=normalized.reply_target.to_jid,
-                        text=message,
-                        user_jid=normalized.reply_target.user_jid or normalized.zoom_user_id,
-                        account_id=normalized.reply_target.account_id,
-                    )
+                for message, zoom_card in zip(bot_messages, zoom_card_contents):
+                    if zoom_card:
+                        logger.info(
+                            "Sending Zoom rich card for adaptive card activity",
+                            extra={"extra": {"to_jid": normalized.reply_target.to_jid}},
+                        )
+                        await self._zoom_chat.send_rich_message(
+                            access_token=access_token,
+                            to_jid=normalized.reply_target.to_jid,
+                            content=zoom_card,
+                            user_jid=normalized.reply_target.user_jid or normalized.zoom_user_id,
+                            account_id=normalized.reply_target.account_id,
+                        )
+                    else:
+                        await self._zoom_chat.send_text_message(
+                            access_token=access_token,
+                            to_jid=normalized.reply_target.to_jid,
+                            text=message,
+                            user_jid=normalized.reply_target.user_jid or normalized.zoom_user_id,
+                            account_id=normalized.reply_target.account_id,
+                        )
                     self._record_outbound_message(mapping, message)
 
                 mapping.watermark = watermark
