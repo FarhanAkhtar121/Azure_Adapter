@@ -39,12 +39,14 @@ class MessageRouterService:
         input_action_id: str | None = None
         input_value: str | None = None
         submit_action_value: str | None = None
+        submit_input_values: dict[str, str] = {}
 
         if event_type == "team_chat.plain_text_input":
             input_action_id, input_value = self._extract_plain_text_input(event_payload, object_payload)
             user_text = input_value or ""
         elif event_type == "interactive_message_actions":
             submit_action_value = self._extract_interactive_action_value(event_payload, object_payload)
+            submit_input_values = self._extract_interactive_input_values(event_payload, object_payload)
             user_text = submit_action_value or self._extract_text(event_payload, object_payload)
         else:
             user_text = self._extract_text(event_payload, object_payload)
@@ -152,51 +154,57 @@ class MessageRouterService:
                 "input_action_id": input_action_id,
                 "input_value": input_value,
                 "submit_action_value": submit_action_value,
+                "submit_input_values": submit_input_values,
             },
         )
 
     @staticmethod
     def _extract_plain_text_input(event_payload: dict, object_payload: dict) -> tuple[str | None, str | None]:
         """Extract action_id + value from a team_chat.plain_text_input payload."""
-        candidates = [object_payload, event_payload]
+        # Multiple action_id/value pairs may exist in one payload (for example, a
+        # card snapshot plus a live edit node). Prefer higher-fidelity keys like
+        # input_value over value, and prefer the last candidate seen.
+        candidates: list[tuple[str, str, int, int]] = []
+        order = 0
 
-        for source in candidates:
-            input_obj = source.get("input") if isinstance(source, dict) else None
-            if isinstance(input_obj, dict):
-                action_id = input_obj.get("action_id") or input_obj.get("actionId")
-                value = (
-                    input_obj.get("value")
-                    or input_obj.get("input_value")
-                    or input_obj.get("inputValue")
-                )
-                if isinstance(action_id, str) and isinstance(value, str) and value.strip():
-                    return action_id.strip(), value.strip()
+        def _append_candidate(action_id: object, value: object, priority: int) -> None:
+            nonlocal order
+            if isinstance(action_id, str) and isinstance(value, str):
+                normalized_value = value.strip()
+                normalized_action = action_id.strip()
+                if normalized_action and normalized_value:
+                    candidates.append((normalized_action, normalized_value, priority, order))
+            order += 1
 
-            if isinstance(source, dict):
-                action_id = source.get("action_id") or source.get("actionId")
-                value = source.get("value") or source.get("input_value") or source.get("inputValue")
-                if isinstance(action_id, str) and isinstance(value, str) and value.strip():
-                    return action_id.strip(), value.strip()
-
-        # Fallback recursive scan for {"action_id": ..., "value": ...}
-        def _scan(node: object) -> tuple[str | None, str | None]:
+        def _scan(node: object) -> None:
             if isinstance(node, dict):
                 action_id = node.get("action_id") or node.get("actionId")
-                value = node.get("value") or node.get("input_value") or node.get("inputValue")
-                if isinstance(action_id, str) and isinstance(value, str) and value.strip():
-                    return action_id.strip(), value.strip()
-                for v in node.values():
-                    found_action, found_value = _scan(v)
-                    if found_action and found_value:
-                        return found_action, found_value
+                if action_id:
+                    _append_candidate(action_id, node.get("input_value"), 3)
+                    _append_candidate(action_id, node.get("inputValue"), 3)
+                    _append_candidate(action_id, node.get("value"), 2)
+
+                input_obj = node.get("input")
+                if isinstance(input_obj, dict):
+                    nested_action_id = input_obj.get("action_id") or input_obj.get("actionId")
+                    _append_candidate(nested_action_id, input_obj.get("input_value"), 4)
+                    _append_candidate(nested_action_id, input_obj.get("inputValue"), 4)
+                    _append_candidate(nested_action_id, input_obj.get("value"), 3)
+
+                for child in node.values():
+                    _scan(child)
             elif isinstance(node, list):
                 for item in node:
-                    found_action, found_value = _scan(item)
-                    if found_action and found_value:
-                        return found_action, found_value
+                    _scan(item)
+
+        _scan(object_payload)
+        _scan(event_payload)
+
+        if not candidates:
             return None, None
 
-        return _scan(object_payload) if object_payload else _scan(event_payload)
+        action_id, value, _, _ = max(candidates, key=lambda item: (item[2], item[3]))
+        return action_id, value
 
     @staticmethod
     def _extract_interactive_action_value(event_payload: dict, object_payload: dict) -> str | None:
@@ -227,6 +235,50 @@ class MessageRouterService:
             return None
 
         return _scan(object_payload) or _scan(event_payload)
+
+    @staticmethod
+    def _extract_interactive_input_values(event_payload: dict, object_payload: dict) -> dict[str, str]:
+        """Extract field action_id -> value pairs from interactive_message_actions payload."""
+        # Keep the best candidate per action_id. Prefer input_value/inputValue over
+        # value so we avoid stale defaults embedded in card snapshots.
+        collected: dict[str, tuple[str, int, int]] = {}
+        order = 0
+
+        def _store_candidate(action_id: object, value: object, priority: int) -> None:
+            nonlocal order
+            if isinstance(action_id, str) and isinstance(value, str):
+                normalized_action = action_id.strip()
+                normalized_value = value.strip()
+                if normalized_action and normalized_value:
+                    prev = collected.get(normalized_action)
+                    if prev is None or (priority, order) >= (prev[1], prev[2]):
+                        collected[normalized_action] = (normalized_value, priority, order)
+            order += 1
+
+        def _scan(node: object) -> None:
+            if isinstance(node, dict):
+                action_id = node.get("action_id") or node.get("actionId")
+                if action_id:
+                    _store_candidate(action_id, node.get("input_value"), 3)
+                    _store_candidate(action_id, node.get("inputValue"), 3)
+                    _store_candidate(action_id, node.get("value"), 2)
+
+                input_obj = node.get("input")
+                if isinstance(input_obj, dict):
+                    nested_action_id = input_obj.get("action_id") or input_obj.get("actionId")
+                    _store_candidate(nested_action_id, input_obj.get("input_value"), 4)
+                    _store_candidate(nested_action_id, input_obj.get("inputValue"), 4)
+                    _store_candidate(nested_action_id, input_obj.get("value"), 3)
+
+                for child in node.values():
+                    _scan(child)
+            elif isinstance(node, list):
+                for item in node:
+                    _scan(item)
+
+        _scan(object_payload)
+        _scan(event_payload)
+        return {key: value_meta[0] for key, value_meta in collected.items()}
 
     def _extract_text(self, event_payload: dict, object_payload: dict) -> str:
         text = self._pick_from_sources(

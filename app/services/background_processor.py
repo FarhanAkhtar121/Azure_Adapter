@@ -149,7 +149,10 @@ class BackgroundProcessor:
                                 "extra": {
                                     "event_type": normalized.event_type,
                                     "action_id": action_id,
+                                    "input_value": input_value,
+                                    "valid_field_ids": sorted(valid_field_ids),
                                     "cached_override_keys": sorted(cached_overrides.keys()),
+                                    "pending_card_input_ids": [inp.get("id") for inp in pending_card_inputs if inp.get("id")],
                                 }
                             },
                         )
@@ -160,8 +163,11 @@ class BackgroundProcessor:
                                 "extra": {
                                     "event_type": normalized.event_type,
                                     "action_id": action_id,
+                                    "input_value": input_value,
+                                    "valid_field_ids": sorted(valid_field_ids),
                                     "has_pending_inputs": bool(pending_card_inputs),
                                     "is_label_echo": is_label_echo,
+                                    "pending_card_input_ids": [inp.get("id") for inp in pending_card_inputs if inp.get("id")],
                                 }
                             },
                         )
@@ -204,17 +210,63 @@ class BackgroundProcessor:
                                 if isinstance(key, str) and key in field_ids and value is not None:
                                     submit_value[key] = str(value)
 
-                        # Cached plain_text_input edits are authoritative.
+                        # Cached plain_text_input edits are useful, but may be stale if
+                        # Zoom did not emit a final edit event before submit click.
                         applied_overrides = {
                             key: value for key, value in cached_overrides.items() if key in field_ids
+                        }
+                        skipped_overrides = {
+                            key: value for key, value in cached_overrides.items() if key not in field_ids
                         }
                         for key, value in cached_overrides.items():
                             if key in field_ids:
                                 submit_value[key] = value
 
+                        # Values extracted from interactive submit payload are the most
+                        # helpful signal when available, but Zoom may send stale snapshot
+                        # values under this payload. Do not overwrite a fresher cached edit
+                        # when live submit value is equal to the default card value.
+                        live_submit_inputs = normalized.raw_metadata.get("submit_input_values")
+                        applied_submit_inputs: dict[str, str] = {}
+                        default_values: dict[str, str] = {
+                            inp.get("id"): str(inp.get("value"))
+                            for inp in pending_card_inputs
+                            if inp.get("id") and inp.get("value") is not None
+                        }
+                        if isinstance(live_submit_inputs, dict):
+                            for key, value in live_submit_inputs.items():
+                                if (
+                                    isinstance(key, str)
+                                    and key in field_ids
+                                    and value is not None
+                                    and str(value).strip() != ""
+                                ):
+                                    normalized_live = str(value)
+                                    has_cached_edit = key in cached_overrides
+                                    default_for_key = default_values.get(key)
+                                    is_stale_snapshot = (
+                                        has_cached_edit
+                                        and default_for_key is not None
+                                        and normalized_live == default_for_key
+                                        and cached_overrides.get(key) != normalized_live
+                                    )
+                                    if is_stale_snapshot:
+                                        continue
+
+                                    submit_value[key] = normalized_live
+                                    applied_submit_inputs[key] = normalized_live
+
                         logger.info(
                             "Submit overrides applied",
-                            extra={"extra": {"applied_overrides": applied_overrides}},
+                            extra={
+                                "extra": {
+                                    "applied_overrides": applied_overrides,
+                                    "skipped_overrides": skipped_overrides,
+                                    "applied_submit_inputs": applied_submit_inputs,
+                                    "field_ids": sorted(field_ids),
+                                    "cached_override_keys": sorted(cached_overrides.keys()),
+                                }
+                            },
                         )
 
                         outbound_text = ""
@@ -260,13 +312,23 @@ class BackgroundProcessor:
                         applied_overrides = {
                             key: value for key, value in cached_overrides.items() if key in field_ids
                         }
+                        skipped_overrides = {
+                            key: value for key, value in cached_overrides.items() if key not in field_ids
+                        }
                         for key, value in cached_overrides.items():
                             if key in field_ids:
                                 submit_value[key] = value
 
                         logger.info(
                             "Submit overrides applied",
-                            extra={"extra": {"applied_overrides": applied_overrides}},
+                            extra={
+                                "extra": {
+                                    "applied_overrides": applied_overrides,
+                                    "skipped_overrides": skipped_overrides,
+                                    "field_ids": sorted(field_ids),
+                                    "cached_override_keys": sorted(cached_overrides.keys()),
+                                }
+                            },
                         )
 
                     # Submit-style activity: preserve value payload; text is optional.
@@ -335,14 +397,15 @@ class BackgroundProcessor:
                 )
 
                 if detected_inputs:
+                    deduped_inputs = self._dedupe_pending_inputs(detected_inputs)
                     meta = dict(mapping.metadata_json or {})
-                    meta["pending_card_inputs"] = detected_inputs
+                    meta["pending_card_inputs"] = deduped_inputs
                     mapping.metadata_json = meta
                     logger.info(
                         "Adaptive card inputs detected — will emulate Action.Submit on next reply",
                         extra={
                             "extra": {
-                                "input_ids": [inp.get("id") for inp in detected_inputs if inp.get("id")],
+                                "input_ids": [inp.get("id") for inp in deduped_inputs if inp.get("id")],
                             }
                         },
                     )
@@ -555,3 +618,21 @@ class BackgroundProcessor:
                 updates[mapped] = value
 
         return updates
+
+    @staticmethod
+    def _dedupe_pending_inputs(inputs: list[dict]) -> list[dict]:
+        """Return pending inputs deduplicated by field id, preserving first occurrence."""
+        seen: set[str] = set()
+        deduped: list[dict] = []
+
+        for inp in inputs:
+            field_id = inp.get("id")
+            if not isinstance(field_id, str) or not field_id.strip():
+                continue
+            normalized_id = field_id.strip()
+            if normalized_id in seen:
+                continue
+            seen.add(normalized_id)
+            deduped.append(inp)
+
+        return deduped

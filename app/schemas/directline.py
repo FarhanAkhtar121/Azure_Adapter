@@ -23,6 +23,21 @@ class DirectLineAttachment(BaseModel):
     name: str | None = None
 
 
+class DirectLineCardAction(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: str | None = None
+    title: str | None = None
+    value: str | None = None
+    text: str | None = None
+
+
+class DirectLineSuggestedActions(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    actions: list[DirectLineCardAction] = Field(default_factory=list)
+
+
 class DirectLineActivity(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -32,6 +47,7 @@ class DirectLineActivity(BaseModel):
     text: str | None = None
     speak: str | None = None
     attachments: list[DirectLineAttachment] = Field(default_factory=list)
+    suggested_actions: DirectLineSuggestedActions | None = Field(default=None, alias="suggestedActions")
 
 
 class DirectLineActivitiesResponse(BaseModel):

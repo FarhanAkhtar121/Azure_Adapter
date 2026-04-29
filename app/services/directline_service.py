@@ -11,7 +11,11 @@ from app.core.config import Settings
 from app.core.exceptions import DirectLineConversationExpiredError, DirectLineReceiveTimeoutError, DirectLineSendError
 from app.core.logging import get_logger
 from app.models.conversation_mapping import ConversationMapping
-from app.schemas.directline import DirectLineActivitiesResponse, DirectLineAttachment
+from app.schemas.directline import (
+    DirectLineActivitiesResponse,
+    DirectLineAttachment,
+    DirectLineCardAction,
+)
 from app.services.copilot_token_service import CopilotTokenService
 
 logger = get_logger(__name__)
@@ -163,7 +167,12 @@ class DirectLineService:
         zoom_cards: list[dict | None] = []
         current_watermark = watermark
         got_first_bot_reply = False
+        idle_polls_after_first_reply = 0
+        # Allow a few idle polls after first reply because Copilot can emit the
+        # follow-up adaptive card in a later activity batch.
+        max_idle_polls_after_first_reply = 4
         pending_card_inputs: list[dict] = []
+        seen_reply_signatures: set[str] = set()
 
         while (asyncio.get_event_loop().time() - start) < timeout_seconds:
             activities_response = await self.get_activities(
@@ -225,6 +234,12 @@ class DirectLineService:
                             if built:
                                 activity_zoom_card = built
 
+                if activity_zoom_card is None and activity.suggested_actions:
+                    activity_zoom_card = DirectLineService._build_zoom_suggested_actions_content(
+                        activity.text,
+                        activity.suggested_actions.actions,
+                    )
+
                 text = activity.text
                 if not text:
                     for attachment in activity.attachments:
@@ -244,6 +259,20 @@ class DirectLineService:
                             break
 
                 if text:
+                    card_signature = (
+                        json.dumps(activity_zoom_card, sort_keys=True)
+                        if activity_zoom_card is not None
+                        else ""
+                    )
+                    reply_signature = f"{text}\n{card_signature}"
+                    if reply_signature in seen_reply_signatures:
+                        logger.info(
+                            "Skipping duplicate bot reply activity in same poll cycle",
+                            extra={"extra": {"activity_id": activity.id}},
+                        )
+                        continue
+
+                    seen_reply_signatures.add(reply_signature)
                     messages.append(text)
                     zoom_cards.append(activity_zoom_card)
                     new_bot_messages += 1
@@ -260,8 +289,11 @@ class DirectLineService:
 
             if new_bot_messages > 0:
                 got_first_bot_reply = True
+                idle_polls_after_first_reply = 0
             elif got_first_bot_reply:
-                break
+                idle_polls_after_first_reply += 1
+                if idle_polls_after_first_reply >= max_idle_polls_after_first_reply:
+                    break
 
             await asyncio.sleep(interval)
 
@@ -269,6 +301,44 @@ class DirectLineService:
             raise DirectLineReceiveTimeoutError("No bot messages received within polling timeout")
 
         return messages, zoom_cards, current_watermark, pending_card_inputs
+
+    @staticmethod
+    def _build_zoom_suggested_actions_content(
+        text: str | None,
+        actions: list[DirectLineCardAction],
+    ) -> dict | None:
+        """Build a Zoom interactive card for Direct Line suggested actions."""
+        if not actions:
+            return None
+
+        button_items: list[dict] = []
+        for action in actions:
+            label = (action.title or action.text or "").strip()
+            value = (action.value or action.text or action.title or "").strip()
+            if not label or not value:
+                continue
+            button_items.append({"text": label, "value": value})
+
+        if not button_items:
+            return None
+
+        prompt = (text or "Please choose an option").strip()
+        if not prompt:
+            prompt = "Please choose an option"
+
+        return {
+            "head": {"text": "Copilot"},
+            "body": [
+                {
+                    "type": "section",
+                    "layout": "horizontal",
+                    "sections": [
+                        {"type": "message", "text": prompt},
+                        {"type": "actions", "items": button_items},
+                    ],
+                }
+            ],
+        }
 
     @staticmethod
     def _extract_attachment_text(attachment: DirectLineAttachment) -> str | None:

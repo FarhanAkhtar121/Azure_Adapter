@@ -67,6 +67,7 @@ async def test_send_and_poll_directline() -> None:
         if request.method == "GET" and "activities" in str(request.url):
             idx = calls["get"]
             calls["get"] += 1
+            idx = min(idx, len(events) - 1)
             return httpx.Response(200, json=events[idx])
         return httpx.Response(404)
 
@@ -136,6 +137,7 @@ async def test_poll_extracts_adaptive_card_fallback_text() -> None:
         if request.method == "GET" and "activities" in str(request.url):
             idx = calls["get"]
             calls["get"] += 1
+            idx = min(idx, len(events) - 1)
             return httpx.Response(200, json=events[idx])
         return httpx.Response(404)
 
@@ -188,6 +190,7 @@ async def test_poll_extracts_hero_card_text() -> None:
         if request.method == "GET" and "activities" in str(request.url):
             idx = calls["get"]
             calls["get"] += 1
+            idx = min(idx, len(events) - 1)
             return httpx.Response(200, json=events[idx])
         return httpx.Response(404)
 
@@ -241,6 +244,7 @@ async def test_poll_detects_adaptive_card_inputs_for_submit() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and "activities" in str(request.url):
             idx = calls["get"]; calls["get"] += 1
+            idx = min(idx, len(events) - 1)
             return httpx.Response(200, json=events[idx])
         return httpx.Response(404)
 
@@ -267,6 +271,159 @@ async def test_poll_detects_adaptive_card_inputs_for_submit() -> None:
     # Card has inputs + Action.Submit → Zoom card should be built
     assert zoom_cards[0] is not None
     assert zoom_cards[0]["head"]["text"] == "Please answer the following questions:"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_collects_delayed_followup_reply_after_first_idle_poll() -> None:
+    events = [
+        {
+            "activities": [
+                {"id": "1", "type": "message", "from": {"id": "bot"}, "text": "Interim summary"},
+            ],
+            "watermark": "1",
+        },
+        {"activities": [], "watermark": "1"},
+        {
+            "activities": [
+                {"id": "2", "type": "message", "from": {"id": "bot"}, "text": "Review and Edit Ticket Details"},
+            ],
+            "watermark": "2",
+        },
+        {"activities": [], "watermark": "2"},
+        {"activities": [], "watermark": "2"},
+        {"activities": [], "watermark": "2"},
+        {"activities": [], "watermark": "2"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = calls["get"]
+            calls["get"] += 1
+            idx = min(idx, len(events) - 1)
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+        conversation_id="conv1",
+        token="token",
+        watermark=None,
+        user_from_id="zoom:u1",
+    )
+
+    assert messages == ["Interim summary", "Review and Edit Ticket Details"]
+    assert zoom_cards == [None, None]
+    assert watermark == "2"
+    assert pending_inputs == []
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_skips_duplicate_bot_replies_in_same_request_cycle() -> None:
+    events = [
+        {
+            "activities": [
+                {"id": "1", "type": "message", "from": {"id": "bot"}, "text": "Review and Edit Ticket Details"},
+                {"id": "2", "type": "message", "from": {"id": "bot"}, "text": "Review and Edit Ticket Details"},
+            ],
+            "watermark": "2",
+        },
+        {"activities": [], "watermark": "2"},
+        {"activities": [], "watermark": "2"},
+        {"activities": [], "watermark": "2"},
+        {"activities": [], "watermark": "2"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = calls["get"]
+            calls["get"] += 1
+            idx = min(idx, len(events) - 1)
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+        conversation_id="conv1",
+        token="token",
+        watermark=None,
+        user_from_id="zoom:u1",
+    )
+
+    assert messages == ["Review and Edit Ticket Details"]
+    assert zoom_cards == [None]
+    assert watermark == "2"
+    assert pending_inputs == []
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_renders_suggested_actions_as_zoom_buttons() -> None:
+    events = [
+        {
+            "activities": [
+                {
+                    "id": "1",
+                    "type": "message",
+                    "from": {"id": "bot"},
+                    "text": "Do you want to proceed with the incident creation?",
+                    "suggestedActions": {
+                        "actions": [
+                            {"type": "imBack", "title": "Yes", "value": "yes"},
+                            {"type": "imBack", "title": "No", "value": "no"},
+                        ]
+                    },
+                }
+            ],
+            "watermark": "1",
+        },
+        {"activities": [], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = calls["get"]
+            calls["get"] += 1
+            idx = min(idx, len(events) - 1)
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+        conversation_id="conv1",
+        token="token",
+        watermark=None,
+        user_from_id="zoom:u1",
+    )
+
+    assert messages == ["Do you want to proceed with the incident creation?"]
+    assert watermark == "1"
+    assert pending_inputs == []
+    assert zoom_cards[0] is not None
+    actions = zoom_cards[0]["body"][0]["sections"][1]["items"]
+    assert actions == [
+        {"text": "Yes", "value": "yes"},
+        {"text": "No", "value": "no"},
+    ]
+
     await client.aclose()
 
 
@@ -311,6 +468,7 @@ async def test_poll_renders_adaptive_card_input_values() -> None:
         if request.method == "GET" and "activities" in str(request.url):
             idx = calls["get"]
             calls["get"] += 1
+            idx = min(idx, len(events) - 1)
             return httpx.Response(200, json=events[idx])
         return httpx.Response(404)
 
