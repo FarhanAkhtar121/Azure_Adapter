@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 
@@ -45,10 +46,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if settings.app_env.lower() in {"local", "dev", "development"}:
+        db_url = settings.database_url
+
+        # Ensure SQLite directory exists before SQLAlchemy tries to connect.
+        # This is especially important on Azure App Service when using a path
+        # like /home/site/wwwroot/data/zoom_copilot_adapter.db.
+        if db_url.startswith("sqlite"):
+            sqlite_path = db_url.replace("sqlite+aiosqlite:///", "", 1)
+            db_file = Path(sqlite_path)
+            db_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create tables automatically for local/dev, and also for SQLite-based deployments
+        # such as temporary Azure App Service testing.
+        if db_url.startswith("sqlite") or settings.app_env.lower() in {"local", "dev", "development"}:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
+
         yield
+
         await engine.dispose()
 
     app = FastAPI(title="Zoom Copilot Adapter", version="1.0.0", lifespan=lifespan)
