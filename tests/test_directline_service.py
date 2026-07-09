@@ -86,7 +86,7 @@ async def test_send_and_poll_directline() -> None:
     )
     assert activity_id == "activity-id"
 
-    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -145,7 +145,7 @@ async def test_poll_extracts_adaptive_card_fallback_text() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2, DEBUG_TRANSCRIPT_LOGGING=True)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -198,7 +198,7 @@ async def test_poll_extracts_hero_card_text() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -252,7 +252,7 @@ async def test_poll_detects_adaptive_card_inputs_for_submit() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
         conversation_id="conv1", token="token", watermark=None, user_from_id="zoom:u1",
     )
 
@@ -309,7 +309,7 @@ async def test_poll_collects_delayed_followup_reply_after_first_idle_poll() -> N
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -353,7 +353,7 @@ async def test_poll_skips_duplicate_bot_replies_in_same_request_cycle() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -407,7 +407,7 @@ async def test_poll_renders_suggested_actions_as_zoom_buttons() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -476,7 +476,7 @@ async def test_poll_renders_adaptive_card_input_values() -> None:
     settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
     service = DirectLineService(settings=settings, client=client)
 
-    messages, zoom_cards, watermark, pending_inputs = await service.poll_for_bot_reply(
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
         conversation_id="conv1",
         token="token",
         watermark=None,
@@ -550,7 +550,7 @@ def test_build_zoom_card_content_submit_encodes_postback() -> None:
 
 
 def test_build_zoom_card_content_open_url() -> None:
-    """Action.OpenUrl should be rendered as a markdown link in a message section."""
+    """Action.OpenUrl should be rendered as a Zoom native hyperlink section (type+link properties)."""
     content = {
         "type": "AdaptiveCard",
         "body": [{"type": "TextBlock", "text": "View your ticket"}],
@@ -562,10 +562,11 @@ def test_build_zoom_card_content_open_url() -> None:
     link_section = next(
         item for item in result["body"]
         if item.get("type") == "section" and
-        any("Open Portal" in s.get("text", "") for s in item.get("sections", []))
+        any(s.get("type") == "message" and s.get("link") for s in item.get("sections", []))
     )
-    link_text = next(s["text"] for s in link_section["sections"] if "Open Portal" in s.get("text", ""))
-    assert "[Open Portal](https://portal.example.com)" in link_text
+    link_item = next(s for s in link_section["sections"] if s.get("link"))
+    assert link_item["text"] == "Open Portal"
+    assert link_item["link"] == "https://portal.example.com"
 
 
 def test_build_zoom_card_content_returns_none_without_title() -> None:
@@ -578,3 +579,232 @@ def test_build_zoom_card_content_returns_none_without_title() -> None:
     }
     result = DirectLineService._build_zoom_card_content(content, [])
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Auth card detection tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_poll_detects_signin_card_sets_auth_flag() -> None:
+    """A signin card attachment should set auth_card_detected=True."""
+    signin_activity = {
+        "id": "50", "type": "message", "from": {"id": "bot"},
+        "text": "Please sign in",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.signin",
+            "content": {"text": "Sign in", "buttons": []},
+        }],
+    }
+    events = [
+        {"activities": [signin_activity], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = min(calls["get"], len(events) - 1); calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
+        conversation_id="conv1", token="token", watermark=None, user_from_id="zoom:u1",
+    )
+    assert auth_card_detected is True
+    assert messages == ["Please sign in"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_detects_adaptive_card_with_open_url_sets_auth_flag() -> None:
+    """An Adaptive Card with Action.OpenUrl should set auth_card_detected=True."""
+    login_card_activity = {
+        "id": "60", "type": "message", "from": {"id": "bot"},
+        "text": "To continue, please login",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "type": "AdaptiveCard",
+                "body": [{"type": "TextBlock", "text": "To continue, please login"}],
+                "actions": [{"type": "Action.OpenUrl", "title": "Login", "url": "https://login.example.com"}],
+            },
+        }],
+    }
+    events = [
+        {"activities": [login_card_activity], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = min(calls["get"], len(events) - 1); calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
+        conversation_id="conv1", token="token", watermark=None, user_from_id="zoom:u1",
+    )
+    assert auth_card_detected is True
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_submit_only_card_does_not_set_auth_flag() -> None:
+    """An Adaptive Card with only Action.Submit (regular form) should NOT set auth_card_detected."""
+    form_card_activity = {
+        "id": "70", "type": "message", "from": {"id": "bot"},
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "type": "AdaptiveCard",
+                "body": [
+                    {"type": "TextBlock", "text": "Fill the form"},
+                    {"type": "Input.Text", "id": "field1"},
+                ],
+                "actions": [{"type": "Action.Submit", "title": "Submit"}],
+            },
+        }],
+    }
+    events = [
+        {"activities": [form_card_activity], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = min(calls["get"], len(events) - 1); calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
+        conversation_id="conv1", token="token", watermark=None, user_from_id="zoom:u1",
+    )
+    assert auth_card_detected is False
+    assert pending_inputs[0]["id"] == "field1"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_auth_card_with_input_still_stores_pending_inputs() -> None:
+    """Auth card with Input.Text still stores pending_card_inputs for Submit button flow."""
+    auth_card_with_input = {
+        "id": "80", "type": "message", "from": {"id": "bot"},
+        "text": "Enter the verification code",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "type": "AdaptiveCard",
+                "body": [
+                    {"type": "TextBlock", "text": "Enter verification code"},
+                    {"type": "Input.Text", "id": "verificationCode", "placeholder": "Enter code"},
+                ],
+                "actions": [
+                    {"type": "Action.OpenUrl", "title": "Login", "url": "https://login.example.com"},
+                    {"type": "Action.Submit", "title": "Verify"},
+                ],
+            },
+        }],
+    }
+    events = [
+        {"activities": [auth_card_with_input], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = min(calls["get"], len(events) - 1); calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
+        conversation_id="conv1", token="token", watermark=None, user_from_id="zoom:u1",
+    )
+    assert auth_card_detected is True
+    assert any(inp["id"] == "verificationCode" for inp in pending_inputs)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poll_signin_card_builds_zoom_card_with_hyperlink() -> None:
+    """A signin card with buttons should produce a Zoom card with a native link section."""
+    signin_activity = {
+        "id": "90", "type": "message", "from": {"id": "bot"},
+        "text": "Please sign in to continue",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.signin",
+            "content": {
+                "text": "To continue, please login",
+                "buttons": [{"type": "signin", "title": "Login", "value": "https://token.botframework.com/api/oauth/signin?signin=abc123"}],
+            },
+        }],
+    }
+    events = [
+        {"activities": [signin_activity], "watermark": "1"},
+        {"activities": [], "watermark": "1"},
+    ]
+    calls = {"get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "activities" in str(request.url):
+            idx = min(calls["get"], len(events) - 1); calls["get"] += 1
+            return httpx.Response(200, json=events[idx])
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(POLL_INTERVAL_SECONDS=0.01, POLL_TIMEOUT_SECONDS=2)
+    service = DirectLineService(settings=settings, client=client)
+
+    messages, zoom_cards, watermark, pending_inputs, auth_card_detected = await service.poll_for_bot_reply(
+        conversation_id="conv1", token="token", watermark=None, user_from_id="zoom:u1",
+    )
+    assert auth_card_detected is True
+    assert messages == ["Please sign in to continue"]
+    assert zoom_cards[0] is not None, "Expected a Zoom card to be built from the signin card"
+    card = zoom_cards[0]
+    assert card["head"]["text"] == "To continue, please login"
+    link_item = card["body"][0]["sections"][0]
+    assert link_item["type"] == "message"
+    assert link_item["text"] == "Login"
+    assert link_item["link"] == "https://token.botframework.com/api/oauth/signin?signin=abc123"
+    await client.aclose()
+
+
+def test_build_zoom_signin_card_content_no_buttons_returns_none() -> None:
+    """A signin card with no signin buttons should return None."""
+    result = DirectLineService._build_zoom_signin_card_content({"text": "Sign in", "buttons": []})
+    assert result is None
+
+
+def test_build_zoom_signin_card_content_with_button() -> None:
+    """A signin card with a signin button produces a Zoom card with a native hyperlink section."""
+    content = {
+        "text": "Please sign in",
+        "buttons": [{"type": "signin", "title": "Sign In", "value": "https://login.example.com/auth"}],
+    }
+    result = DirectLineService._build_zoom_signin_card_content(content)
+    assert result is not None
+    assert result["head"]["text"] == "Please sign in"
+    link_item = result["body"][0]["sections"][0]
+    assert link_item["type"] == "message"
+    assert link_item["text"] == "Sign In"
+    assert link_item["link"] == "https://login.example.com/auth"

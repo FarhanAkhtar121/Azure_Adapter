@@ -17,7 +17,7 @@ class Settings(BaseSettings):
         default="sqlite+aiosqlite:///./zoom_copilot_adapter.db", alias="DATABASE_URL"
     )
 
-    zoom_secret_token: str = Field(default="", alias="ZOOM_SECRET_TOKEN")
+    zoom_secret_token: str = "B0ihE2OFS_mcTDVvZEm6cQ"
     zoom_client_id: str = Field(default="", alias="ZOOM_CLIENT_ID")
     zoom_client_secret: str = Field(default="", alias="ZOOM_CLIENT_SECRET")
     zoom_account_id: str = Field(default="", alias="ZOOM_ACCOUNT_ID")
@@ -34,10 +34,30 @@ class Settings(BaseSettings):
 
     poll_interval_seconds: float = Field(default=1.5, alias="POLL_INTERVAL_SECONDS")
     poll_timeout_seconds: int = Field(default=25, alias="POLL_TIMEOUT_SECONDS")
+    websocket_idle_window_seconds: float = Field(default=3.0, alias="WEBSOCKET_IDLE_WINDOW_SECONDS")
+
+    conversation_ttl_hours: int = Field(default=24, alias="CONVERSATION_TTL_HOURS")
+    cleanup_interval_seconds: int = Field(default=3600, alias="CLEANUP_INTERVAL_SECONDS")
 
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     debug_transcript_logging: bool = Field(default=False, alias="DEBUG_TRANSCRIPT_LOGGING")
+
+    def validate_required(self) -> None:
+        """Raise ValueError listing every required env var that is empty."""
+        missing = []
+        if not self.zoom_secret_token:
+            missing.append("ZOOM_SECRET_TOKEN")
+        if not self.zoom_bot_jid:
+            missing.append("ZOOM_BOT_JID")
+        if not self.zoom_client_id:
+            missing.append("ZOOM_CLIENT_ID")
+        if not self.zoom_client_secret:
+            missing.append("ZOOM_CLIENT_SECRET")
+        if not self.directline_secret:
+            missing.append("DIRECTLINE_SECRET")
+        if missing:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
 
 @lru_cache(maxsize=1)

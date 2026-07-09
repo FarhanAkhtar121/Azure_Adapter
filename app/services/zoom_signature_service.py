@@ -11,7 +11,8 @@ class ZoomSignatureService:
     """Validates Zoom webhook signatures using the configured secret token."""
 
     def __init__(self, settings: Settings):
-        self._secret = settings.zoom_secret_token
+        # Strip to guard against CRLF / trailing whitespace from .env files.
+        self._secret = settings.zoom_secret_token.strip()
 
     def verify_signature(self, headers: dict, raw_body: bytes) -> bool:
         if not self._secret:
@@ -33,3 +34,11 @@ class ZoomSignatureService:
             raise InvalidSignatureError("Invalid Zoom webhook signature")
 
         return True
+
+    def compute_encrypted_token(self, plain_token: str) -> str:
+        """Compute the encryptedToken required by Zoom endpoint URL validation."""
+        return hmac.new(
+            self._secret.encode("utf-8"),
+            plain_token.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()

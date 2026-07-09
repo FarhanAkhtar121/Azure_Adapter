@@ -109,6 +109,7 @@ class BackgroundProcessor:
                     for k, v in (meta.get("card_input_overrides") or {}).items()
                     if isinstance(k, str)
                 }
+                auth_card_pending: bool = bool(meta.get("auth_card_pending", False))
                 submit_value: dict | None = None
                 outbound_text = normalized.user_text
 
@@ -272,6 +273,7 @@ class BackgroundProcessor:
                         outbound_text = ""
                         meta.pop("pending_card_inputs", None)
                         meta.pop("card_input_overrides", None)
+                        meta.pop("auth_card_pending", None)
                         mapping.metadata_json = meta
                         logger.info(
                             "Zoom submit button clicked — using encoded card values",
@@ -284,6 +286,29 @@ class BackgroundProcessor:
                         )
                         pending_card_inputs = []  # consumed; skip text-parse block below
                 # -------------------------------------------------------------------------
+
+                # --- Auth card bypass -------------------------------------------
+                # If the previous bot response included a login/auth card (detected
+                # by Action.OpenUrl or signin/oauth content type), the user's next
+                # plain-text message is the OAuth magic code.  Send it as-is so the
+                # Bot Framework SDK can validate it.  Button postbacks (zoom_action)
+                # are excluded — they follow the normal submit path above.
+                if auth_card_pending and not normalized.user_text.startswith('{"zoom_action":'):
+                    pending_card_inputs = []
+                    meta.pop("auth_card_pending", None)
+                    meta.pop("pending_card_inputs", None)
+                    meta.pop("card_input_overrides", None)
+                    mapping.metadata_json = meta
+                    logger.info(
+                        "Auth card pending — sending user message as plain text for magic code validation",
+                        extra={
+                            "extra": {
+                                "event_type": normalized.event_type,
+                                "text_preview": normalized.user_text[:20],
+                            }
+                        },
+                    )
+                # ---------------------------------------------------------------
 
                 if pending_card_inputs:
                     action_data: dict = {}
@@ -389,7 +414,7 @@ class BackgroundProcessor:
                         value=submit_value,
                     )
 
-                bot_messages, zoom_card_contents, watermark, detected_inputs = await self._directline.poll_for_bot_reply(
+                bot_messages, zoom_card_contents, watermark, detected_inputs, auth_card_detected = await self._directline.stream_for_bot_reply(
                     conversation_id=mapping.directline_conversation_id,
                     token=mapping.directline_token,
                     watermark=mapping.watermark,
@@ -410,6 +435,18 @@ class BackgroundProcessor:
                         },
                     )
 
+                if auth_card_detected:
+                    meta = dict(mapping.metadata_json or {})
+                    meta["auth_card_pending"] = True
+                    mapping.metadata_json = meta
+                    logger.info(
+                        "Auth card detected — next plain-text reply will bypass form submission",
+                        extra={"extra": {"conversation_id": mapping.directline_conversation_id}},
+                    )
+
+                # Only pass a real thread ID — "root" is an internal sentinel meaning no thread.
+                reply_thread_id = normalized.zoom_thread_id if normalized.zoom_thread_id != "root" else None
+
                 access_token = await self._zoom_auth.get_chatbot_access_token()
                 for message, zoom_card in zip(bot_messages, zoom_card_contents):
                     if zoom_card:
@@ -423,6 +460,7 @@ class BackgroundProcessor:
                             content=zoom_card,
                             user_jid=normalized.reply_target.user_jid or normalized.zoom_user_id,
                             account_id=normalized.reply_target.account_id,
+                            thread_id=reply_thread_id,
                         )
                     else:
                         await self._zoom_chat.send_text_message(
@@ -431,6 +469,7 @@ class BackgroundProcessor:
                             text=message,
                             user_jid=normalized.reply_target.user_jid or normalized.zoom_user_id,
                             account_id=normalized.reply_target.account_id,
+                            thread_id=reply_thread_id,
                         )
                     self._record_outbound_message(mapping, message)
 

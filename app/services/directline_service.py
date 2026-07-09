@@ -2,9 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 from datetime import datetime, timezone
 
 import httpx
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import WebSocketException
+
+
+def _make_ssl_context() -> ssl.SSLContext:
+    """Return an SSL context that can verify botframework.com certificates.
+
+    Python on macOS ships without system root CAs accessible to the ssl module.
+    certifi (already installed as an httpx dependency) provides the Mozilla CA bundle.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_WS_SSL_CONTEXT = _make_ssl_context()
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from app.core.config import Settings
@@ -13,6 +32,7 @@ from app.core.logging import get_logger
 from app.models.conversation_mapping import ConversationMapping
 from app.schemas.directline import (
     DirectLineActivitiesResponse,
+    DirectLineActivity,
     DirectLineAttachment,
     DirectLineCardAction,
 )
@@ -22,7 +42,7 @@ logger = get_logger(__name__)
 
 
 class DirectLineService:
-    """Handles Direct Line send/receive flows with polling for bot replies."""
+    """Handles Direct Line send/receive flows with WebSocket streaming and polling fallback."""
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None):
         self._settings = settings
@@ -151,30 +171,173 @@ class DirectLineService:
 
         return DirectLineActivitiesResponse.model_validate(response.json())
 
+    def _process_activity_list(
+        self,
+        activities: list[DirectLineActivity],
+        user_from_id: str,
+        seen_ids: set[str],
+        seen_reply_signatures: set[str],
+        messages: list[str],
+        zoom_cards: list[dict | None],
+        pending_card_inputs: list[dict],
+        auth_cards_detected: list[bool],
+    ) -> int:
+        """Process a batch of Direct Line activities, accumulating bot replies into the provided lists.
+
+        Returns the count of new bot messages added in this batch.
+        """
+        new_bot_messages = 0
+        for activity in activities:
+            if not activity.id or activity.id in seen_ids:
+                continue
+            seen_ids.add(activity.id)
+
+            attachment_types = [a.content_type for a in activity.attachments if a.content_type]
+            if self._settings.debug_transcript_logging:
+                logger.debug(
+                    "Direct Line activity received",
+                    extra={
+                        "extra": {
+                            "activity_id": activity.id,
+                            "type": activity.type,
+                            "sender": activity.from_.id if activity.from_ else None,
+                            "has_text": bool(activity.text),
+                            "text_preview": (activity.text or "")[:120],
+                            "attachment_count": len(activity.attachments),
+                            "attachment_types": attachment_types,
+                        }
+                    },
+                )
+
+            if activity.type != "message":
+                logger.debug(
+                    "Skipping non-message activity",
+                    extra={"extra": {"activity_id": activity.id, "type": activity.type}},
+                )
+                continue
+
+            sender = activity.from_.id if activity.from_ else ""
+            if sender == user_from_id:
+                continue
+
+            activity_zoom_card: dict | None = None
+            for attachment in activity.attachments:
+                # Detect signin/oauth card types — always auth cards
+                if attachment.content_type in (
+                    "application/vnd.microsoft.card.signin",
+                    "application/vnd.microsoft.card.oauth",
+                ):
+                    if not auth_cards_detected:
+                        auth_cards_detected.append(True)
+                        logger.info(
+                            "Auth signin/oauth card detected in bot reply",
+                            extra={"extra": {"activity_id": activity.id, "content_type": attachment.content_type}},
+                        )
+                    if activity_zoom_card is None and attachment.content:
+                        built = DirectLineService._build_zoom_signin_card_content(attachment.content)
+                        if built:
+                            activity_zoom_card = built
+                elif (
+                    attachment.content_type == "application/vnd.microsoft.card.adaptive"
+                    and attachment.content
+                ):
+                    card_inputs = DirectLineService._extract_card_inputs(attachment.content)
+                    if card_inputs:
+                        pending_card_inputs.extend(card_inputs)
+                    # Adaptive cards with Action.OpenUrl are auth/login cards — user
+                    # will paste the verification code as a plain chat message
+                    if not auth_cards_detected and any(
+                        isinstance(a, dict) and a.get("type") == "Action.OpenUrl"
+                        for a in (attachment.content.get("actions") or [])
+                    ):
+                        auth_cards_detected.append(True)
+                        logger.info(
+                            "Auth adaptive card (Action.OpenUrl) detected in bot reply",
+                            extra={"extra": {"activity_id": activity.id}},
+                        )
+                    if activity_zoom_card is None:
+                        built = DirectLineService._build_zoom_card_content(attachment.content, card_inputs)
+                        if built:
+                            activity_zoom_card = built
+
+            if activity_zoom_card is None and activity.suggested_actions:
+                activity_zoom_card = DirectLineService._build_zoom_suggested_actions_content(
+                    activity.text,
+                    activity.suggested_actions.actions,
+                )
+
+            text = activity.text
+            if not text:
+                for attachment in activity.attachments:
+                    extracted = self._extract_attachment_text(attachment)
+                    if extracted:
+                        text = extracted
+                        logger.info(
+                            "Extracted fallback text from attachment",
+                            extra={
+                                "extra": {
+                                    "activity_id": activity.id,
+                                    "content_type": attachment.content_type,
+                                    "text_preview": text[:120],
+                                }
+                            },
+                        )
+                        break
+
+            if text:
+                card_signature = (
+                    json.dumps(activity_zoom_card, sort_keys=True)
+                    if activity_zoom_card is not None
+                    else ""
+                )
+                reply_signature = f"{text}\n{card_signature}"
+                if reply_signature in seen_reply_signatures:
+                    logger.info(
+                        "Skipping duplicate bot reply activity in same poll cycle",
+                        extra={"extra": {"activity_id": activity.id}},
+                    )
+                    continue
+                seen_reply_signatures.add(reply_signature)
+                messages.append(text)
+                zoom_cards.append(activity_zoom_card)
+                new_bot_messages += 1
+            else:
+                logger.warning(
+                    "Bot message has no text and no extractable attachment content — dropped",
+                    extra={
+                        "extra": {
+                            "activity_id": activity.id,
+                            "attachment_types": attachment_types,
+                        }
+                    },
+                )
+
+        return new_bot_messages
+
     async def poll_for_bot_reply(
         self,
         conversation_id: str,
         token: str,
         watermark: str | None,
         user_from_id: str,
-    ) -> tuple[list[str], list[dict | None], str | None, list[dict]]:
+    ) -> tuple[list[str], list[dict | None], str | None, list[dict], bool]:
         timeout_seconds = self._settings.poll_timeout_seconds
         interval = self._settings.poll_interval_seconds
 
-        start = asyncio.get_event_loop().time()
+        loop = asyncio.get_running_loop()
+        start = loop.time()
         seen_ids: set[str] = set()
         messages: list[str] = []
         zoom_cards: list[dict | None] = []
         current_watermark = watermark
         got_first_bot_reply = False
         idle_polls_after_first_reply = 0
-        # Allow a few idle polls after first reply because Copilot can emit the
-        # follow-up adaptive card in a later activity batch.
-        max_idle_polls_after_first_reply = 4
+        max_idle_polls_after_first_reply = 2
         pending_card_inputs: list[dict] = []
+        auth_cards_detected: list[bool] = []
         seen_reply_signatures: set[str] = set()
 
-        while (asyncio.get_event_loop().time() - start) < timeout_seconds:
+        while (loop.time() - start) < timeout_seconds:
             activities_response = await self.get_activities(
                 conversation_id=conversation_id,
                 token=token,
@@ -182,110 +345,13 @@ class DirectLineService:
             )
             current_watermark = activities_response.watermark or current_watermark
 
-            new_bot_messages = 0
-            for activity in activities_response.activities:
-                if not activity.id or activity.id in seen_ids:
-                    continue
-                seen_ids.add(activity.id)
-
-                attachment_types = [
-                    a.content_type for a in activity.attachments if a.content_type
-                ]
-                if self._settings.debug_transcript_logging:
-                    logger.debug(
-                        "Direct Line activity received",
-                        extra={
-                            "extra": {
-                                "activity_id": activity.id,
-                                "type": activity.type,
-                                "sender": activity.from_.id if activity.from_ else None,
-                                "has_text": bool(activity.text),
-                                "text_preview": (activity.text or "")[:120],
-                                "attachment_count": len(activity.attachments),
-                                "attachment_types": attachment_types,
-                            }
-                        },
-                    )
-
-                if activity.type != "message":
-                    logger.debug(
-                        "Skipping non-message activity",
-                        extra={"extra": {"activity_id": activity.id, "type": activity.type}},
-                    )
-                    continue
-
-                sender = activity.from_.id if activity.from_ else ""
-                if sender == user_from_id:
-                    continue
-
-                activity_zoom_card: dict | None = None
-                for attachment in activity.attachments:
-                    if (
-                        attachment.content_type == "application/vnd.microsoft.card.adaptive"
-                        and attachment.content
-                    ):
-                        card_inputs = DirectLineService._extract_card_inputs(attachment.content)
-                        if card_inputs:
-                            pending_card_inputs.extend(card_inputs)
-                        if activity_zoom_card is None:
-                            built = DirectLineService._build_zoom_card_content(
-                                attachment.content, card_inputs
-                            )
-                            if built:
-                                activity_zoom_card = built
-
-                if activity_zoom_card is None and activity.suggested_actions:
-                    activity_zoom_card = DirectLineService._build_zoom_suggested_actions_content(
-                        activity.text,
-                        activity.suggested_actions.actions,
-                    )
-
-                text = activity.text
-                if not text:
-                    for attachment in activity.attachments:
-                        extracted = self._extract_attachment_text(attachment)
-                        if extracted:
-                            text = extracted
-                            logger.info(
-                                "Extracted fallback text from attachment",
-                                extra={
-                                    "extra": {
-                                        "activity_id": activity.id,
-                                        "content_type": attachment.content_type,
-                                        "text_preview": text[:120],
-                                    }
-                                },
-                            )
-                            break
-
-                if text:
-                    card_signature = (
-                        json.dumps(activity_zoom_card, sort_keys=True)
-                        if activity_zoom_card is not None
-                        else ""
-                    )
-                    reply_signature = f"{text}\n{card_signature}"
-                    if reply_signature in seen_reply_signatures:
-                        logger.info(
-                            "Skipping duplicate bot reply activity in same poll cycle",
-                            extra={"extra": {"activity_id": activity.id}},
-                        )
-                        continue
-
-                    seen_reply_signatures.add(reply_signature)
-                    messages.append(text)
-                    zoom_cards.append(activity_zoom_card)
-                    new_bot_messages += 1
-                else:
-                    logger.warning(
-                        "Bot message has no text and no extractable attachment content — dropped",
-                        extra={
-                            "extra": {
-                                "activity_id": activity.id,
-                                "attachment_types": attachment_types,
-                            }
-                        },
-                    )
+            new_bot_messages = self._process_activity_list(
+                activities_response.activities,
+                user_from_id,
+                seen_ids, seen_reply_signatures,
+                messages, zoom_cards, pending_card_inputs,
+                auth_cards_detected,
+            )
 
             if new_bot_messages > 0:
                 got_first_bot_reply = True
@@ -300,7 +366,176 @@ class DirectLineService:
         if not messages:
             raise DirectLineReceiveTimeoutError("No bot messages received within polling timeout")
 
-        return messages, zoom_cards, current_watermark, pending_card_inputs
+        return messages, zoom_cards, current_watermark, pending_card_inputs, bool(auth_cards_detected)
+
+    async def _get_stream_url(
+        self,
+        conversation_id: str,
+        token: str,
+        watermark: str | None,
+    ) -> str | None:
+        """Fetch a fresh WebSocket stream URL for the given conversation."""
+        params: dict[str, str] = {}
+        if watermark:
+            params["watermark"] = watermark
+        url = f"{self._base}/conversations/{conversation_id}"
+        try:
+            response = await self._client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Error fetching Direct Line stream URL",
+                extra={"extra": {"error": str(exc), "conversation_id": conversation_id}},
+            )
+            return None
+
+        if response.status_code >= 400:
+            logger.warning(
+                "Failed to obtain Direct Line stream URL",
+                extra={"extra": {"status": response.status_code, "conversation_id": conversation_id}},
+            )
+            return None
+
+        stream_url: str | None = response.json().get("streamUrl")
+        logger.info(
+            "Direct Line stream URL obtained",
+            extra={"extra": {"conversation_id": conversation_id, "has_stream_url": bool(stream_url)}},
+        )
+        return stream_url
+
+    async def _receive_via_websocket(
+        self,
+        stream_url: str,
+        watermark: str | None,
+        user_from_id: str,
+    ) -> tuple[list[str], list[dict | None], str | None, list[dict], bool]:
+        """Receive bot activities from the Direct Line WebSocket stream.
+
+        Connects with the current watermark so only new activities are delivered.
+        After the first bot reply arrives, waits up to websocket_idle_window_seconds
+        for follow-up activities (e.g., a trailing adaptive card) before returning.
+        The overall poll_timeout_seconds is the hard cap.
+        """
+        timeout_seconds = self._settings.poll_timeout_seconds
+        idle_window = self._settings.websocket_idle_window_seconds
+
+        seen_ids: set[str] = set()
+        messages: list[str] = []
+        zoom_cards: list[dict | None] = []
+        current_watermark = watermark
+        pending_card_inputs: list[dict] = []
+        auth_cards_detected: list[bool] = []
+        seen_reply_signatures: set[str] = set()
+        got_first_bot_reply = False
+
+        url = stream_url
+        if watermark:
+            separator = "&" if "?" in stream_url else "?"
+            url = f"{stream_url}{separator}watermark={watermark}"
+
+        logger.info(
+            "Connecting to Direct Line WebSocket",
+            extra={"extra": {"has_watermark": bool(watermark)}},
+        )
+
+        try:
+            async with ws_connect(
+                url,
+                ssl=_WS_SSL_CONTEXT,
+                open_timeout=10,
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + timeout_seconds
+
+                while loop.time() < deadline:
+                    remaining = deadline - loop.time()
+                    # After first reply: use short idle window; before: wait up to deadline
+                    recv_timeout = min(idle_window if got_first_bot_reply else remaining, remaining)
+                    if recv_timeout <= 0:
+                        break
+
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
+                    except asyncio.TimeoutError:
+                        # Idle window expired after first reply, or overall deadline reached
+                        break
+
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8")
+
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    activities_response = DirectLineActivitiesResponse.model_validate(data)
+                    current_watermark = activities_response.watermark or current_watermark
+
+                    new_bot_messages = self._process_activity_list(
+                        activities_response.activities,
+                        user_from_id,
+                        seen_ids, seen_reply_signatures,
+                        messages, zoom_cards, pending_card_inputs,
+                        auth_cards_detected,
+                    )
+
+                    if new_bot_messages > 0:
+                        got_first_bot_reply = True
+
+        except WebSocketException as exc:
+            raise RuntimeError(f"Direct Line WebSocket connection failed: {exc}") from exc
+
+        if not messages:
+            raise DirectLineReceiveTimeoutError("No bot messages received via WebSocket within timeout")
+
+        logger.info(
+            "WebSocket receive complete",
+            extra={"extra": {"message_count": len(messages), "watermark": current_watermark}},
+        )
+        return messages, zoom_cards, current_watermark, pending_card_inputs, bool(auth_cards_detected)
+
+    async def stream_for_bot_reply(
+        self,
+        conversation_id: str,
+        token: str,
+        watermark: str | None,
+        user_from_id: str,
+    ) -> tuple[list[str], list[dict | None], str | None, list[dict], bool]:
+        """Receive bot replies via WebSocket streaming with automatic polling fallback.
+
+        The WebSocket path delivers activities in real-time, eliminating polling intervals
+        and reducing typical response latency significantly. Falls back to HTTP polling if
+        the stream URL is unavailable or the WebSocket connection fails.
+
+        Returns a 5-tuple: (messages, zoom_cards, watermark, pending_card_inputs, auth_card_detected).
+        auth_card_detected is True when the bot reply included a signin/oauth card or an
+        Adaptive Card with Action.OpenUrl — the caller should store auth_card_pending so
+        that the user's next plain-text reply (the magic code) bypasses form submission.
+        """
+        stream_url = await self._get_stream_url(conversation_id, token, watermark)
+
+        if stream_url:
+            try:
+                return await self._receive_via_websocket(stream_url, watermark, user_from_id)
+            except DirectLineReceiveTimeoutError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "WebSocket receive failed — falling back to polling",
+                    extra={"extra": {"error": str(exc), "conversation_id": conversation_id}},
+                )
+        else:
+            logger.info(
+                "No Direct Line stream URL available — using polling",
+                extra={"extra": {"conversation_id": conversation_id}},
+            )
+
+        return await self.poll_for_bot_reply(conversation_id, token, watermark, user_from_id)
 
     @staticmethod
     def _build_zoom_suggested_actions_content(
@@ -370,6 +605,12 @@ class DirectLineService:
             if content.get("text"):
                 parts.append(content["text"])
             return "\n".join(parts) if parts else None
+
+        if ct in (
+            "application/vnd.microsoft.card.signin",
+            "application/vnd.microsoft.card.oauth",
+        ):
+            return content.get("text") or None
 
         return None
 
@@ -587,9 +828,9 @@ class DirectLineService:
             if isinstance(raw, dict):
                 action_data.update(raw)
 
-        # Process actions: submit buttons + open-url markdown links
+        # Process actions: submit buttons + open-url links
         action_buttons: list[dict] = []
-        open_url_links: list[str] = []
+        open_url_links: list[dict] = []  # each entry: {"text": ..., "link": ...}
 
         for action in content.get("actions", []):
             if not isinstance(action, dict):
@@ -608,12 +849,15 @@ class DirectLineService:
             elif action_type == "Action.OpenUrl":
                 url = action.get("url", "")
                 if url:
-                    open_url_links.append(f"[{title}]({url})")
+                    open_url_links.append({"text": title, "link": url})
 
         if open_url_links:
             body.append({
                 "type": "section",
-                "sections": [{"type": "message", "text": "  ".join(open_url_links)}],
+                "sections": [
+                    {"type": "message", "text": lnk["text"], "link": lnk["link"]}
+                    for lnk in open_url_links
+                ],
             })
 
         if action_buttons:
@@ -637,3 +881,27 @@ class DirectLineService:
             head["sub_head"] = {"text": sub_head_text}
 
         return {"head": head, "body": body}
+
+    @staticmethod
+    def _build_zoom_signin_card_content(content: dict) -> dict | None:
+        """Transform a signin/oauth card into a Zoom interactive message content dict.
+
+        Renders each signin button as a Zoom native hyperlink using the
+        {"type": "message", "text": <label>, "link": <url>} section format.
+        Returns None if no signin buttons with URLs are found.
+        """
+        head_text = content.get("text", "").strip() or "Sign In Required"
+        buttons = content.get("buttons") or []
+        link_sections: list[dict] = []
+        for btn in buttons:
+            if not isinstance(btn, dict):
+                continue
+            btn_type = btn.get("type", "")
+            title = btn.get("title", "Sign In")
+            value = btn.get("value", "")
+            if btn_type == "signin" and value:
+                link_sections.append({"type": "message", "text": title, "link": value})
+        if not link_sections:
+            return None
+        body = [{"type": "section", "sections": link_sections}]
+        return {"head": {"text": head_text}, "body": body}

@@ -64,12 +64,14 @@ class ZoomChatService:
         text: str,
         user_jid: str,
         account_id: str | None = None,
+        thread_id: str | None = None,
     ) -> None:
         payload = self.build_message_payload(
             to_jid=to_jid,
             text=text,
             user_jid=user_jid,
             account_id=account_id,
+            thread_id=thread_id,
         )
 
         url = f"{self._base}/v2/im/chat/messages"
@@ -135,6 +137,7 @@ class ZoomChatService:
         content: dict,
         user_jid: str,
         account_id: str | None = None,
+        thread_id: str | None = None,
     ) -> None:
         """Send a Zoom Team Chat chatbot message using the native interactive card format."""
         payload = self.build_rich_message_payload(
@@ -142,6 +145,7 @@ class ZoomChatService:
             content=content,
             user_jid=user_jid,
             account_id=account_id,
+            thread_id=thread_id,
         )
 
         url = f"{self._base}/v2/im/chat/messages"

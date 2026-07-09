@@ -18,7 +18,9 @@ class ZoomAuthService:
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None):
         self._settings = settings
-        self._client = client or httpx.AsyncClient(timeout=settings.request_timeout_seconds)
+        self._client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=settings.request_timeout_seconds, write=10.0, pool=5.0)
+        )
         self._cached_token: str | None = None
         self._expires_at: datetime | None = None
         self._lock = asyncio.Lock()
@@ -35,8 +37,8 @@ class ZoomAuthService:
 
     @retry(
         reraise=True,
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, min=0.5, max=2),
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=1),
         retry=retry_if_exception_type((httpx.TimeoutException, httpx.HTTPStatusError)),
     )
     async def _fetch_token(self) -> tuple[str, int]:

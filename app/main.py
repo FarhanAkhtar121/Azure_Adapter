@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -8,9 +10,10 @@ from fastapi import FastAPI
 from app.api.routes.health import router as health_router
 from app.api.routes.zoom_webhook import router as zoom_webhook_router
 from app.core.config import Settings, get_settings
-from app.core.logging import configure_logging
+from app.core.logging import configure_logging, get_logger
 from app.models import conversation_mapping  # noqa: F401
 from app.models.db import Base, build_engine, build_session_factory
+from app.repositories.sqlalchemy_conversation_repository import SqlAlchemyConversationRepository
 from app.services.background_processor import BackgroundProcessor
 from app.services.copilot_token_service import CopilotTokenService
 from app.services.directline_service import DirectLineService
@@ -18,6 +21,8 @@ from app.services.message_router_service import MessageRouterService
 from app.services.zoom_auth_service import ZoomAuthService
 from app.services.zoom_chat_service import ZoomChatService
 from app.services.zoom_signature_service import ZoomSignatureService
+
+logger = get_logger(__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -44,8 +49,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         zoom_chat_service=zoom_chat_service,
     )
 
+    async def _cleanup_loop(interval_seconds: int, ttl_hours: int) -> None:
+        """Periodically delete conversation mappings older than ttl_hours."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+            try:
+                async with session_factory() as session:
+                    repo = SqlAlchemyConversationRepository(session)
+                    deleted = await repo.delete_expired(cutoff)
+                if deleted:
+                    logger.info(
+                        "Expired conversation mappings deleted",
+                        extra={"extra": {"count": deleted, "cutoff": cutoff.isoformat()}},
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "Cleanup loop error",
+                    extra={"extra": {"error": str(exc)}},
+                )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Validate required env vars before accepting traffic.
+        settings.validate_required()
+        logger.info("Configuration validated — all required env vars present")
+
         db_url = settings.database_url
 
         # Ensure SQLite directory exists before SQLAlchemy tries to connect.
@@ -62,7 +91,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
 
+        cleanup_task = asyncio.create_task(
+            _cleanup_loop(settings.cleanup_interval_seconds, settings.conversation_ttl_hours)
+        )
+
         yield
+
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
 
         await engine.dispose()
 
